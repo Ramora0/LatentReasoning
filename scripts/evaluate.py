@@ -40,6 +40,18 @@ def main():
     if args.benchmarks:
         config.eval.benchmarks = args.benchmarks
 
+    # Resolve local paths from scratch
+    scratch_dir = config.paths.scratch_dir if hasattr(config, "paths") else None
+    eval_data_dir = None
+
+    if scratch_dir:
+        local_model = os.path.join(
+            scratch_dir, "models", config.model.name.split("/")[-1]
+        )
+        if os.path.isdir(local_model):
+            config.model.name = local_model
+        eval_data_dir = os.path.join(scratch_dir, "datasets")
+
     backend = getattr(config.distributed, "backend", "cuda")
     if backend == "xla":
         import torch_xla.core.xla_model as xm
@@ -70,7 +82,7 @@ def main():
     print(f"Evaluating with K={K}, p={p}")
 
     # Run evaluation
-    evaluator = Evaluator(config, tokenizer, device)
+    evaluator = Evaluator(config, tokenizer, device, eval_data_dir=eval_data_dir)
     results = evaluator.evaluate(model, K=K, p=p)
 
     print("\nResults:")

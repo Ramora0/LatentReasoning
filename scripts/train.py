@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
 
 import torch
@@ -93,6 +94,45 @@ def main():
         print(f"Backend: {backend}")
         print(f"Config:\n{OmegaConf.to_yaml(config)}")
 
+    # --- Resolve local paths from scratch ---
+    scratch_dir = config.paths.scratch_dir if hasattr(config, "paths") else None
+    model_path = config.model.name
+    dataset_path = None
+    eval_data_dir = None
+
+    if scratch_dir:
+        local_model = os.path.join(
+            scratch_dir, "models", config.model.name.split("/")[-1]
+        )
+        if os.path.isdir(local_model):
+            model_path = local_model
+
+        local_dataset = os.path.join(
+            scratch_dir, "datasets", config.data.dataset.split("/")[-1]
+        )
+        if os.path.isdir(local_dataset):
+            dataset_path = local_dataset
+
+        eval_data_dir = os.path.join(scratch_dir, "datasets")
+
+    # Copy training dataset to $TMPDIR for fast I/O during training
+    tmp_dir = os.environ.get("TMPDIR")
+    if tmp_dir and dataset_path:
+        tmp_dataset = os.path.join(
+            tmp_dir, "datasets", config.data.dataset.split("/")[-1]
+        )
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if local_rank == 0 and not os.path.isdir(tmp_dataset):
+            if rank == 0:
+                print(f"Copying dataset to TMPDIR: {tmp_dataset}")
+            shutil.copytree(dataset_path, tmp_dataset)
+        if is_distributed:
+            dist.barrier()
+        dataset_path = tmp_dataset
+
+    # Point model loading at the resolved path
+    config.model.name = model_path
+
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model.name)
     if tokenizer.pad_token is None:
@@ -105,6 +145,7 @@ def main():
         tokenizer=tokenizer,
         max_question_tokens=config.data.max_question_tokens,
         max_answer_tokens=config.data.max_answer_tokens,
+        data_dir=dataset_path,
     )
     collator = LatentReasoningCollator(tokenizer=tokenizer)
 
@@ -115,7 +156,7 @@ def main():
 
     # Build evaluator
     device = _get_device(backend, rank)
-    evaluator = Evaluator(config, tokenizer, device)
+    evaluator = Evaluator(config, tokenizer, device, eval_data_dir=eval_data_dir)
 
     # Build trainer and train
     trainer = LatentReasoningTrainer(

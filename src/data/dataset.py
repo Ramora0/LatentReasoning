@@ -1,6 +1,5 @@
 import torch
 from torch.utils.data import Dataset
-from datasets import load_dataset
 from transformers import PreTrainedTokenizer
 
 
@@ -13,14 +12,22 @@ class BigMathDataset(Dataset):
         max_question_tokens: int = 512,
         max_answer_tokens: int = 64,
         split: str = "train",
+        data_dir: str = None,
     ):
         self.tokenizer = tokenizer
         self.max_question_tokens = max_question_tokens
         self.max_answer_tokens = max_answer_tokens
 
-        self.data = load_dataset(
-            "SynthLabsAI/Big-Math-RL-Verified", split=split
-        )
+        if data_dir is not None:
+            from datasets import load_from_disk
+            ds = load_from_disk(data_dir)
+            # load_from_disk may return DatasetDict or Dataset
+            self.data = ds[split] if hasattr(ds, "keys") else ds
+        else:
+            from datasets import load_dataset
+            self.data = load_dataset(
+                "SynthLabsAI/Big-Math-RL-Verified", split=split
+            )
 
     def __len__(self) -> int:
         return len(self.data)

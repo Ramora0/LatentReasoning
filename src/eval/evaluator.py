@@ -1,5 +1,6 @@
+import os
+
 import torch
-from datasets import load_dataset
 from transformers import PreTrainedTokenizer
 from tqdm import tqdm
 
@@ -9,12 +10,14 @@ from .metrics import extract_answer, numerical_compare
 class Evaluator:
     """Evaluate latent reasoning model on GSM8K and MATH benchmarks."""
 
-    def __init__(self, config, tokenizer: PreTrainedTokenizer, device: torch.device):
+    def __init__(self, config, tokenizer: PreTrainedTokenizer, device: torch.device,
+                 eval_data_dir: str = None):
         self.config = config
         self.tokenizer = tokenizer
         self.device = device
         self.max_new_tokens = config.eval.max_new_tokens
         self.benchmarks = config.eval.benchmarks
+        self.eval_data_dir = eval_data_dir
 
     def evaluate(self, model, K: int, p: float) -> dict:
         """Run evaluation on all configured benchmarks."""
@@ -28,9 +31,20 @@ class Evaluator:
                 results["math_accuracy"] = acc
         return results
 
+    def _load_dataset(self, local_subdir, hf_name, hf_config=None, split="test"):
+        """Load a dataset from local disk (if available) or HuggingFace Hub."""
+        if self.eval_data_dir:
+            local_path = os.path.join(self.eval_data_dir, local_subdir)
+            if os.path.isdir(local_path):
+                from datasets import load_from_disk
+                ds = load_from_disk(local_path)
+                return ds[split] if hasattr(ds, "keys") else ds
+        from datasets import load_dataset
+        return load_dataset(hf_name, hf_config, split=split)
+
     def _eval_gsm8k(self, model, K: int, p: float) -> float:
         """Evaluate on GSM8K test set."""
-        dataset = load_dataset("gsm8k", "main", split="test")
+        dataset = self._load_dataset("gsm8k", "gsm8k", hf_config="main")
         return self._eval_dataset(
             model, dataset, K, p,
             question_key="question",
@@ -41,9 +55,11 @@ class Evaluator:
     def _eval_math(self, model, K: int, p: float) -> float:
         """Evaluate on MATH test set."""
         try:
-            dataset = load_dataset("hendrycks/competition_math", split="test")
+            dataset = self._load_dataset(
+                "competition_math", "hendrycks/competition_math"
+            )
         except Exception:
-            dataset = load_dataset("lighteval/MATH", split="test")
+            dataset = self._load_dataset("MATH", "lighteval/MATH")
         return self._eval_dataset(
             model, dataset, K, p,
             question_key="problem",
