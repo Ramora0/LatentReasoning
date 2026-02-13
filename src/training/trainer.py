@@ -42,7 +42,6 @@ class LatentReasoningTrainer:
         self.train_dataset = train_dataset
         self.collator = collator
         self.evaluator = evaluator
-        self.curriculum = CurriculumScheduler(config)
         self.K = config.latent.K
 
         self.backend = getattr(config.distributed, "backend", "cuda")
@@ -80,19 +79,33 @@ class LatentReasoningTrainer:
         # Build optimizer with two param groups
         self.optimizer = self._build_optimizer()
 
-        # Build scheduler
-        num_warmup = int(config.training.max_steps * config.training.warmup_ratio)
-        self.scheduler = _get_cosine_schedule_with_warmup(
-            self.optimizer, num_warmup, config.training.max_steps
-        )
-
-        # DataLoader
+        # DataLoader (must be built before scheduler so we can compute total steps)
+        self.grad_accum_steps = config.training.gradient_accumulation_steps
         self.dataloader = self._build_dataloader()
 
+        # Compute total optimizer steps from num_epochs
+        self.num_epochs = config.training.num_epochs
+        batches_per_epoch = len(self.dataloader)  # micro-batches per epoch per GPU
+        optimizer_steps_per_epoch = batches_per_epoch // self.grad_accum_steps
+        self.max_optimizer_steps = optimizer_steps_per_epoch * self.num_epochs
+
+        if self.is_main:
+            print(f"Training for {self.num_epochs} epochs")
+            print(f"  {batches_per_epoch} micro-batches/epoch, "
+                  f"{optimizer_steps_per_epoch} optimizer steps/epoch, "
+                  f"{self.max_optimizer_steps} total optimizer steps")
+
+        # Curriculum (needs max_optimizer_steps to compute p annealing)
+        self.curriculum = CurriculumScheduler(config, self.max_optimizer_steps)
+
+        # Build scheduler
+        num_warmup = int(self.max_optimizer_steps * config.training.warmup_ratio)
+        self.scheduler = _get_cosine_schedule_with_warmup(
+            self.optimizer, num_warmup, self.max_optimizer_steps
+        )
+
         # State
-        self.global_step = 0
         self.optimizer_step = 0
-        self.grad_accum_steps = config.training.gradient_accumulation_steps
 
         # Checkpointing
         self.save_dir = Path(config.checkpointing.save_dir)
@@ -301,22 +314,21 @@ class LatentReasoningTrainer:
     # ---- Training loop ----
 
     def train(self):
-        """Main training loop."""
+        """Main training loop.
+
+        Iterates for exactly num_epochs over the dataset. All schedules
+        (LR, p-annealing) and logging intervals are based on optimizer
+        steps, which are deterministic given (dataset_size, batch_size,
+        grad_accum, world_size, num_epochs).
+        """
         self.model.train()
-        max_steps = self.config.training.max_steps
+        max_steps = self.max_optimizer_steps
         log_every = self.config.logging.log_every_steps
         eval_every = self.config.eval.eval_every_steps
         save_every = self.config.checkpointing.save_every_steps
 
-        # For XLA, wrap the dataloader with MpDeviceLoader for async host-to-device transfer
-        if self.use_xla:
-            device_loader = self._pl.MpDeviceLoader(self.dataloader, self.device)
-        else:
-            device_loader = None
-
-        data_iter = iter(device_loader if device_loader is not None else self.dataloader)
-        epoch = 0
         accum_loss = 0.0
+        micro_step = 0  # counts forward passes within current accumulation window
         step_start_time = time.monotonic()
 
         pbar = tqdm(
@@ -324,110 +336,113 @@ class LatentReasoningTrainer:
             desc="Training",
             disable=not self.is_main,
         )
+        pbar.update(self.optimizer_step)
 
-        while self.global_step < max_steps:
-            # Get batch (cycle through epochs)
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                epoch += 1
-                if self.is_distributed and hasattr(self.dataloader, "sampler"):
-                    sampler = self.dataloader.sampler
-                    if hasattr(sampler, "set_epoch"):
-                        sampler.set_epoch(epoch)
-                if device_loader is not None:
-                    data_iter = iter(device_loader)
-                else:
-                    data_iter = iter(self.dataloader)
-                batch = next(data_iter)
+        for epoch in range(self.num_epochs):
+            # Set epoch for distributed sampler (shuffles differently each epoch)
+            if self.is_distributed and hasattr(self.dataloader, "sampler"):
+                sampler = self.dataloader.sampler
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
 
-            # Move batch to device (MpDeviceLoader already does this for XLA)
-            if not self.use_xla:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+            # For XLA, wrap the dataloader with MpDeviceLoader each epoch
+            if self.use_xla:
+                epoch_loader = self._pl.MpDeviceLoader(self.dataloader, self.device)
+            else:
+                epoch_loader = self.dataloader
 
-            # Get curriculum values
-            K = self.K
-            p = self.curriculum.get_p(self.global_step)
+            for batch in epoch_loader:
+                # Move batch to device (MpDeviceLoader already does this for XLA)
+                if not self.use_xla:
+                    batch = {k: v.to(self.device) for k, v in batch.items()}
 
-            # Forward pass
-            with torch.autocast(
-                device_type=self._autocast_device,
-                dtype=torch.bfloat16,
-                enabled=self.config.training.bf16,
-            ):
-                outputs = self.model(
-                    question_ids=batch["question_ids"],
-                    question_mask=batch["question_mask"],
-                    answer_ids=batch["answer_ids"],
-                    answer_mask=batch["answer_mask"],
-                    K=K,
-                    p=p,
-                )
-                loss = outputs["loss"] / self.grad_accum_steps
+                # Get curriculum values (based on optimizer steps for consistency)
+                K = self.K
+                p = self.curriculum.get_p(self.optimizer_step)
 
-            # Backward
-            loss.backward()
-            accum_loss += loss.item()
-
-            # Step every grad_accum_steps
-            if (self.global_step + 1) % self.grad_accum_steps == 0 or self.global_step == max_steps - 1:
-                # Gradient clipping
-                grad_norm = self._clip_grad_norm()
-
-                # Optimizer step (XLA needs mark_step)
-                if self.use_xla:
-                    self._xla_step()
-                else:
-                    self.optimizer.step()
-                    self.scheduler.step()
-                self.optimizer.zero_grad()
-                self.optimizer_step += 1
-
-                # Logging (based on optimizer steps, not micro-steps)
-                if self.is_main and self.optimizer_step % log_every == 0:
-                    step_time = time.monotonic() - step_start_time
-                    samples_per_sec = (
-                        log_every * self.grad_accum_steps
-                        * self.config.training.batch_size_per_gpu
-                        * self.world_size / step_time
+                # Forward pass
+                with torch.autocast(
+                    device_type=self._autocast_device,
+                    dtype=torch.bfloat16,
+                    enabled=self.config.training.bf16,
+                ):
+                    outputs = self.model(
+                        question_ids=batch["question_ids"],
+                        question_mask=batch["question_mask"],
+                        answer_ids=batch["answer_ids"],
+                        answer_mask=batch["answer_mask"],
+                        K=K,
+                        p=p,
                     )
-                    lrs = self.scheduler.get_last_lr()
-                    log_dict = {
-                        "train/loss": accum_loss,
-                        "train/perplexity": math.exp(min(accum_loss, 20)),
-                        "train/grad_norm": grad_norm,
-                        "train/lr": lrs[0],
-                        "train/epoch": epoch,
-                        "train/samples_per_sec": samples_per_sec,
-                        "curriculum/K": K,
-                        "curriculum/p": p,
-                    }
-                    if torch.cuda.is_available():
-                        log_dict["system/gpu_memory_allocated_gb"] = (
-                            torch.cuda.max_memory_allocated(self.device) / 1e9
+                    loss = outputs["loss"] / self.grad_accum_steps
+
+                # Backward
+                loss.backward()
+                accum_loss += loss.item()
+                micro_step += 1
+
+                # Optimizer step every grad_accum_steps micro-batches
+                if micro_step % self.grad_accum_steps == 0:
+                    # Gradient clipping
+                    grad_norm = self._clip_grad_norm()
+
+                    # Optimizer step (XLA needs mark_step)
+                    if self.use_xla:
+                        self._xla_step()
+                    else:
+                        self.optimizer.step()
+                        self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    self.optimizer_step += 1
+
+                    # Logging (based on optimizer steps)
+                    if self.is_main and self.optimizer_step % log_every == 0:
+                        step_time = time.monotonic() - step_start_time
+                        samples_per_sec = (
+                            log_every * self.grad_accum_steps
+                            * self.config.training.batch_size_per_gpu
+                            * self.world_size / step_time
                         )
-                        log_dict["system/gpu_memory_reserved_gb"] = (
-                            torch.cuda.max_memory_reserved(self.device) / 1e9
-                        )
-                        torch.cuda.reset_peak_memory_stats(self.device)
-                    if wandb is not None and wandb.run is not None:
-                        wandb.log(log_dict, step=self.global_step)
-                    pbar.set_postfix(loss=f"{accum_loss:.4f}", K=K, p=f"{p:.3f}")
-                    step_start_time = time.monotonic()
+                        lrs = self.scheduler.get_last_lr()
+                        log_dict = {
+                            "train/loss": accum_loss,
+                            "train/perplexity": math.exp(min(accum_loss, 20)),
+                            "train/grad_norm": grad_norm,
+                            "train/lr": lrs[0],
+                            "train/epoch": epoch,
+                            "train/samples_per_sec": samples_per_sec,
+                            "curriculum/K": K,
+                            "curriculum/p": p,
+                        }
+                        if torch.cuda.is_available():
+                            log_dict["system/gpu_memory_allocated_gb"] = (
+                                torch.cuda.max_memory_allocated(self.device) / 1e9
+                            )
+                            log_dict["system/gpu_memory_reserved_gb"] = (
+                                torch.cuda.max_memory_reserved(self.device) / 1e9
+                            )
+                            torch.cuda.reset_peak_memory_stats(self.device)
+                        if wandb is not None and wandb.run is not None:
+                            wandb.log(log_dict, step=self.optimizer_step)
+                        pbar.set_postfix(loss=f"{accum_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+                        step_start_time = time.monotonic()
 
-                accum_loss = 0.0
+                    accum_loss = 0.0
 
-                # Evaluation
-                if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
-                    self._run_eval(K, p)
-                    self.model.train()
+                    # Evaluation
+                    if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
+                        self._run_eval(K, p)
+                        self.model.train()
 
-                # Checkpointing
-                if self.optimizer_step % save_every == 0:
-                    self._save_checkpoint()
+                    # Checkpointing
+                    if self.optimizer_step % save_every == 0:
+                        self._save_checkpoint()
 
-            self.global_step += 1
-            pbar.update(1)
+                    pbar.update(1)
+
+            if self.is_main:
+                print(f"\nEpoch {epoch + 1}/{self.num_epochs} complete "
+                      f"(optimizer step {self.optimizer_step}/{max_steps})")
 
         pbar.close()
 
@@ -446,18 +461,18 @@ class LatentReasoningTrainer:
         results = self.evaluator.evaluate(self.model, K=K, p=p)
 
         if self.is_main:
-            print(f"\n[Step {self.global_step}] Eval results: {results}")
+            print(f"\n[Step {self.optimizer_step}] Eval results: {results}")
             if wandb is not None and wandb.run is not None:
                 wandb.log(
                     {f"eval/{k}": v for k, v in results.items()},
-                    step=self.global_step,
+                    step=self.optimizer_step,
                 )
 
     # ---- Checkpointing (backend-aware) ----
 
     def _save_checkpoint(self):
         """Save checkpoint (full state dict on rank 0)."""
-        ckpt_path = self.save_dir / f"step_{self.global_step}"
+        ckpt_path = self.save_dir / f"step_{self.optimizer_step}"
 
         if self.use_xla:
             self._save_checkpoint_xla(ckpt_path)
@@ -487,9 +502,9 @@ class LatentReasoningTrainer:
                             "model_state_dict": model_state,
                             "optimizer_state_dict": None,
                             "scheduler_state_dict": self.scheduler.state_dict(),
-                            "global_step": self.global_step,
+                            "optimizer_step": self.optimizer_step,
                             "K": self.K,
-                            "p": self.curriculum.get_p(self.global_step),
+                            "p": self.curriculum.get_p(self.optimizer_step),
                         },
                         ckpt_path / "checkpoint.pt",
                     )
@@ -500,9 +515,9 @@ class LatentReasoningTrainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "scheduler_state_dict": self.scheduler.state_dict(),
-                    "global_step": self.global_step,
+                    "optimizer_step": self.optimizer_step,
                     "K": self.K,
-                    "p": self.curriculum.get_p(self.global_step),
+                    "p": self.curriculum.get_p(self.optimizer_step),
                 },
                 ckpt_path / "checkpoint.pt",
             )
@@ -526,9 +541,9 @@ class LatentReasoningTrainer:
             "model_state_dict": model_state,
             "optimizer_state_dict": None,
             "scheduler_state_dict": self.scheduler.state_dict(),
-            "global_step": self.global_step,
+            "optimizer_step": self.optimizer_step,
             "K": self.K,
-            "p": self.curriculum.get_p(self.global_step),
+            "p": self.curriculum.get_p(self.optimizer_step),
         }
         xm.save(ckpt_data, str(ckpt_path / "checkpoint.pt"), master_only=True)
 

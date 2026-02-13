@@ -8,12 +8,12 @@ latent:
   K: 8
   p_start: 0.9
   p_end: 0.0
-  p_anneal_steps: 50000
+  p_anneal_ratio: 0.8
 
 training:
   batch_size_per_gpu: 8
   gradient_accumulation_steps: 2
-  max_steps: 60000
+  num_epochs: 5
   learning_rate: 2e-5
   weight_decay: 0.01
   warmup_ratio: 0.05

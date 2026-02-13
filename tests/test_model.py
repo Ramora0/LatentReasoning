@@ -28,7 +28,7 @@ TEST_CONFIG = OmegaConf.create({
         "K": 8,
         "p_start": 0.9,
         "p_end": 0.0,
-        "p_anneal_steps": 50000,
+        "p_anneal_ratio": 0.8,
     },
 })
 
@@ -37,17 +37,18 @@ TEST_CONFIG = OmegaConf.create({
 
 class TestCurriculumScheduler:
     def setup_method(self):
-        self.scheduler = CurriculumScheduler(TEST_CONFIG)
+        # 10000 total optimizer steps, p_anneal_ratio=0.8 → anneal over 8000 steps
+        self.scheduler = CurriculumScheduler(TEST_CONFIG, max_optimizer_steps=10000)
 
     def test_p_annealing(self):
         # At step 0: p = 0.9
         assert abs(self.scheduler.get_p(0) - 0.9) < 1e-6
-        # At step 25000 (halfway): p = 0.45
-        assert abs(self.scheduler.get_p(25000) - 0.45) < 1e-6
-        # At step 50000: p = 0.0
-        assert abs(self.scheduler.get_p(50000) - 0.0) < 1e-6
+        # At step 4000 (halfway through 8000): p = 0.45
+        assert abs(self.scheduler.get_p(4000) - 0.45) < 1e-6
+        # At step 8000: p = 0.0
+        assert abs(self.scheduler.get_p(8000) - 0.0) < 1e-6
         # Beyond anneal steps: p stays at 0.0
-        assert abs(self.scheduler.get_p(60000) - 0.0) < 1e-6
+        assert abs(self.scheduler.get_p(10000) - 0.0) < 1e-6
 
 
 # --- Full Model Tests (require GPU and model download) ---
