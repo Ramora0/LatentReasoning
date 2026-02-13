@@ -27,9 +27,7 @@ TEST_CONFIG = OmegaConf.create({
         "bridge": {"identity_init_scale": 0.01},
     },
     "latent": {
-        "initial_K": 2,
-        "max_K": 8,
-        "k_schedule": [[0, 2], [10000, 4], [25000, 8]],
+        "K": 8,
         "p_start": 0.9,
         "p_end": 0.0,
         "p_anneal_steps": 50000,
@@ -73,14 +71,6 @@ class TestBridgeLayer:
 class TestCurriculumScheduler:
     def setup_method(self):
         self.scheduler = CurriculumScheduler(TEST_CONFIG)
-
-    def test_k_schedule(self):
-        assert self.scheduler.get_K(0) == 2
-        assert self.scheduler.get_K(5000) == 2
-        assert self.scheduler.get_K(10000) == 4
-        assert self.scheduler.get_K(15000) == 4
-        assert self.scheduler.get_K(25000) == 8
-        assert self.scheduler.get_K(50000) == 8
 
     def test_p_annealing(self):
         # At step 0: p = 0.9

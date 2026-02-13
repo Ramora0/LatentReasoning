@@ -15,6 +15,7 @@ dependencies = [
     "wandb",
     "omegaconf",
     "tqdm",
+    "math-verify[antlr4_13_2]",
 ]
 
 [project.optional-dependencies]

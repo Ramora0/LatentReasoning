@@ -4,7 +4,7 @@ import torch
 from transformers import PreTrainedTokenizer
 from tqdm import tqdm
 
-from .metrics import extract_answer, numerical_compare
+from .metrics import check_answer
 
 
 class Evaluator:
@@ -24,8 +24,10 @@ class Evaluator:
         results = {}
         for benchmark in self.benchmarks:
             if benchmark == "gsm8k":
-                acc = self._eval_gsm8k(model, K, p)
+                acc, correct, total = self._eval_gsm8k(model, K, p)
                 results["gsm8k_accuracy"] = acc
+                results["gsm8k_correct"] = correct
+                results["gsm8k_total"] = total
         return results
 
     def _load_dataset(self, local_subdir, hf_name, hf_config=None, split="test"):
@@ -58,16 +60,19 @@ class Evaluator:
         question_key: str,
         answer_key: str,
         benchmark_name: str,
-    ) -> float:
-        """Evaluate model on a dataset of math problems."""
+    ) -> tuple[float, int, int]:
+        """Evaluate model on a dataset of math problems.
+
+        Returns:
+            (accuracy, correct_count, total_count)
+        """
         model.eval()
         correct = 0
         total = 0
 
         for item in tqdm(dataset, desc=f"Eval {benchmark_name}", leave=False):
             question = item[question_key]
-            gold_answer_text = item[answer_key]
-            gold = extract_answer(gold_answer_text)
+            gold_text = item[answer_key]
 
             # Tokenize question
             enc = self.tokenizer(
@@ -95,13 +100,11 @@ class Evaluator:
                     max_new_tokens=self.max_new_tokens,
                 )
 
-            # Decode and extract answer
             pred_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-            pred = extract_answer(pred_text)
 
-            if numerical_compare(pred, gold):
+            if check_answer(pred_text, gold_text):
                 correct += 1
             total += 1
 
         accuracy = correct / max(total, 1)
-        return accuracy
+        return accuracy, correct, total

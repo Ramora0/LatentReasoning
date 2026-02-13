@@ -1,5 +1,6 @@
 import os
 import math
+import time
 import shutil
 import functools
 from pathlib import Path
@@ -43,6 +44,7 @@ class LatentReasoningTrainer:
         self.collator = collator
         self.evaluator = evaluator
         self.curriculum = CurriculumScheduler(config)
+        self.K = config.latent.K
 
         self.backend = getattr(config.distributed, "backend", "cuda")
         self.use_xla = self.backend == "xla"
@@ -90,6 +92,7 @@ class LatentReasoningTrainer:
 
         # State
         self.global_step = 0
+        self.optimizer_step = 0
         self.grad_accum_steps = config.training.gradient_accumulation_steps
 
         # Checkpointing
@@ -333,6 +336,7 @@ class LatentReasoningTrainer:
         data_iter = iter(device_loader if device_loader is not None else self.dataloader)
         epoch = 0
         accum_loss = 0.0
+        step_start_time = time.monotonic()
 
         pbar = tqdm(
             total=max_steps,
@@ -361,7 +365,7 @@ class LatentReasoningTrainer:
                 batch = {k: v.to(self.device) for k, v in batch.items()}
 
             # Get curriculum values
-            K = self.curriculum.get_K(self.global_step)
+            K = self.K
             p = self.curriculum.get_p(self.global_step)
 
             # Forward pass
@@ -396,34 +400,54 @@ class LatentReasoningTrainer:
                     self.optimizer.step()
                     self.scheduler.step()
                 self.optimizer.zero_grad()
+                self.optimizer_step += 1
 
-                # Logging
-                if self.is_main and self.global_step % log_every == 0:
+                # Logging (based on optimizer steps, not micro-steps)
+                if self.is_main and self.optimizer_step % log_every == 0:
+                    step_time = time.monotonic() - step_start_time
+                    samples_per_sec = (
+                        log_every * self.grad_accum_steps
+                        * self.config.training.batch_size_per_gpu
+                        * self.world_size / step_time
+                    )
+                    lrs = self.scheduler.get_last_lr()
                     log_dict = {
-                        "loss": accum_loss,
-                        "grad_norm": grad_norm,
-                        "lr": self.scheduler.get_last_lr()[0],
-                        "K": K,
-                        "p": p,
-                        "step": self.global_step,
+                        "train/loss": accum_loss,
+                        "train/perplexity": math.exp(min(accum_loss, 20)),
+                        "train/grad_norm": grad_norm,
+                        "train/lr_transformer": lrs[0],
+                        "train/lr_bridge": lrs[1] if len(lrs) > 1 else lrs[0],
+                        "train/epoch": epoch,
+                        "train/samples_per_sec": samples_per_sec,
+                        "curriculum/K": K,
+                        "curriculum/p": p,
                     }
+                    if torch.cuda.is_available():
+                        log_dict["system/gpu_memory_allocated_gb"] = (
+                            torch.cuda.max_memory_allocated(self.device) / 1e9
+                        )
+                        log_dict["system/gpu_memory_reserved_gb"] = (
+                            torch.cuda.max_memory_reserved(self.device) / 1e9
+                        )
+                        torch.cuda.reset_peak_memory_stats(self.device)
                     if wandb is not None and wandb.run is not None:
                         wandb.log(log_dict, step=self.global_step)
                     pbar.set_postfix(loss=f"{accum_loss:.4f}", K=K, p=f"{p:.3f}")
+                    step_start_time = time.monotonic()
 
                 accum_loss = 0.0
 
+                # Evaluation
+                if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
+                    self._run_eval(K, p)
+                    self.model.train()
+
+                # Checkpointing
+                if self.optimizer_step % save_every == 0:
+                    self._save_checkpoint()
+
             self.global_step += 1
             pbar.update(1)
-
-            # Evaluation
-            if self.global_step % eval_every == 0 and self.evaluator is not None:
-                self._run_eval(K, p)
-                self.model.train()
-
-            # Checkpointing
-            if self.global_step % save_every == 0:
-                self._save_checkpoint()
 
         pbar.close()
 
@@ -484,7 +508,7 @@ class LatentReasoningTrainer:
                             "optimizer_state_dict": None,
                             "scheduler_state_dict": self.scheduler.state_dict(),
                             "global_step": self.global_step,
-                            "K": self.curriculum.get_K(self.global_step),
+                            "K": self.K,
                             "p": self.curriculum.get_p(self.global_step),
                         },
                         ckpt_path / "checkpoint.pt",
@@ -497,7 +521,7 @@ class LatentReasoningTrainer:
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "scheduler_state_dict": self.scheduler.state_dict(),
                     "global_step": self.global_step,
-                    "K": self.curriculum.get_K(self.global_step),
+                    "K": self.K,
                     "p": self.curriculum.get_p(self.global_step),
                 },
                 ckpt_path / "checkpoint.pt",
@@ -523,7 +547,7 @@ class LatentReasoningTrainer:
             "optimizer_state_dict": None,
             "scheduler_state_dict": self.scheduler.state_dict(),
             "global_step": self.global_step,
-            "K": self.curriculum.get_K(self.global_step),
+            "K": self.K,
             "p": self.curriculum.get_p(self.global_step),
         }
         xm.save(ckpt_data, str(ckpt_path / "checkpoint.pt"), master_only=True)

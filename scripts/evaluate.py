@@ -76,7 +76,7 @@ def main():
     model.eval()
 
     # Get K and p
-    K = args.K if args.K is not None else ckpt.get("K", config.latent.initial_K)
+    K = args.K if args.K is not None else ckpt.get("K", config.latent.K)
     p = args.p if args.p is not None else ckpt.get("p", 0.0)
 
     print(f"Evaluating with K={K}, p={p}")

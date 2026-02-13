@@ -54,9 +54,7 @@ The model (`src/model/latent_gemma.py:LatentReasoningModel`) wraps the base Gemm
 
 ### Curriculum (`src/training/curriculum.py`)
 
-Two schedules drive training:
-- **p annealing**: Linearly interpolates from p_start (0.9) → p_end (0.0) over p_anneal_steps. At p=0.9 the model operates near-standard decoding; at p=0.0 it's pure latent reasoning.
-- **K scheduling**: Stepwise increase in latent iterations (e.g., K=2 → K=4 → K=8 at configured step thresholds).
+K (number of latent iterations) is fixed at 8 for all training (set via `latent.K` in config). The only schedule is **p annealing**: linearly interpolates from p_start (0.9) → p_end (0.0) over p_anneal_steps. At p=0.9 the model operates near-standard decoding; at p=0.0 it's pure latent reasoning.
 
 ### Key Design Detail: Gemma 2 Normalizer
 
