@@ -414,6 +414,12 @@ class LatentReasoningTrainer:
                             "curriculum/K": K,
                             "curriculum/p": p,
                         }
+                        # Per-step latent gradient norms
+                        base = self.model
+                        while hasattr(base, "module"):
+                            base = base.module
+                        for step_k, norm_val in base._latent_grad_norms.items():
+                            log_dict[f"latent_grads/step_{step_k}"] = norm_val
                         if torch.cuda.is_available():
                             log_dict["system/gpu_memory_allocated_gb"] = (
                                 torch.cuda.max_memory_allocated(self.device) / 1e9

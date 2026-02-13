@@ -41,6 +41,9 @@ class LatentReasoningModel(nn.Module):
         # Learned <answer> token inserted between thought vectors and answer decoding
         self.answer_token_emb = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
 
+        # Per-step gradient norms populated by backward hooks in phase2
+        self._latent_grad_norms = {}
+
         # Enable gradient checkpointing on the base model
         if hasattr(self.base_model, "gradient_checkpointing_enable"):
             self.base_model.gradient_checkpointing_enable(
@@ -111,8 +114,9 @@ class LatentReasoningModel(nn.Module):
         """
         B = hidden_states.shape[0]
         device = hidden_states.device
+        self._latent_grad_norms = {}
 
-        for _ in range(K):
+        for k in range(K):
             hidden_states = checkpoint(
                 self._latent_step,
                 hidden_states,
@@ -120,6 +124,14 @@ class LatentReasoningModel(nn.Module):
                 torch.tensor(p),  # must be a tensor for checkpoint
                 use_reentrant=False,
             )
+
+            # Register backward hook to capture gradient norm of thought vector k
+            step_idx = k
+            last_pos = hidden_states.shape[1] - 1
+            def _grad_hook(grad, step=step_idx, pos=last_pos):
+                self._latent_grad_norms[step] = grad[:, pos, :].norm().item()
+            hidden_states.register_hook(_grad_hook)
+
             # Extend mask by one position (outside checkpoint)
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
