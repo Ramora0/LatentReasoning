@@ -54,12 +54,9 @@ class Evaluator:
 
     def _eval_math(self, model, K: int, p: float) -> float:
         """Evaluate on MATH test set."""
-        try:
-            dataset = self._load_dataset(
-                "competition_math", "hendrycks/competition_math"
-            )
-        except Exception:
-            dataset = self._load_dataset("MATH", "lighteval/MATH")
+        dataset = self._load_dataset(
+            "competition_math", "hendrycks/competition_math"
+        )
         return self._eval_dataset(
             model, dataset, K, p,
             question_key="problem",

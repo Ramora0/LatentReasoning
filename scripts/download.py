@@ -91,11 +91,7 @@ def main():
 
     # 4. MATH eval dataset
     print("[4/4] Eval data: hendrycks/competition_math")
-    try:
-        download_dataset("hendrycks/competition_math", scratch_dir)
-    except Exception as e:
-        print(f"  hendrycks/competition_math failed ({e}), trying lighteval/MATH...")
-        download_dataset("lighteval/MATH", scratch_dir)
+    download_dataset("hendrycks/competition_math", scratch_dir)
 
     print(f"\nAll downloads complete.")
     print(f"  Models:   {os.path.join(scratch_dir, 'models')}")
