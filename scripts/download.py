@@ -2,8 +2,8 @@
 """Download all large files to scratch storage.
 
 Run this once before training to avoid repeated downloads:
-    python scripts/download.py
-    python scripts/download.py --scratch-dir /custom/scratch/path
+    HF_TOKEN=hf_xxx python scripts/download.py
+    HF_TOKEN=hf_xxx python scripts/download.py --scratch-dir /custom/scratch/path
 """
 
 import argparse
@@ -65,6 +65,15 @@ def main():
     scratch_dir = args.scratch_dir
     os.makedirs(os.path.join(scratch_dir, "models"), exist_ok=True)
     os.makedirs(os.path.join(scratch_dir, "datasets"), exist_ok=True)
+
+    # Authenticate with HuggingFace if token is set
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        from huggingface_hub import login
+        login(token=hf_token, add_to_git_credential=False)
+        print("Authenticated with HF_TOKEN")
+    else:
+        print("Warning: HF_TOKEN not set, gated models/datasets may fail")
 
     print(f"Scratch directory: {scratch_dir}\n")
 
