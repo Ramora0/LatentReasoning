@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class LatentReasoningModel(nn.Module):
     """Three-phase latent reasoning model built on Gemma 2 2B.
@@ -39,7 +39,14 @@ class LatentReasoningModel(nn.Module):
         # All transformer layer params stay trainable (requires_grad=True by default)
 
         # Learned <answer> token inserted between thought vectors and answer decoding
-        self.answer_token_emb = nn.Parameter(torch.randn(1, 1, self.d_model) * 0.02)
+        # Initialize from the embedding of "answer" (scaled by normalizer) so it
+        # starts at the same magnitude as all other positions in the prefix.
+        _tokenizer = AutoTokenizer.from_pretrained(config.model.name)
+        _answer_id = _tokenizer.encode("answer", add_special_tokens=False)[0]
+        _init_emb = self.base_model.model.embed_tokens.weight[_answer_id].detach().clone()
+        self.answer_token_emb = nn.Parameter(
+            (_init_emb * self.normalizer).reshape(1, 1, self.d_model)
+        )
 
         # Per-step gradient norms populated by backward hooks in phase2
         self._latent_grad_norms = {}
