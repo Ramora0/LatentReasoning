@@ -28,11 +28,11 @@ class LatentReasoningCollator:
             q_ids = item["question_ids"]
             a_ids = item["answer_ids"]
 
-            # Pad questions (right-pad)
+            # Pad questions (left-pad for contiguous RoPE positions)
             q_pad_len = max_q_len - len(q_ids)
-            q_padded = torch.cat([q_ids, torch.full((q_pad_len,), pad_id, dtype=q_ids.dtype)])
-            q_mask = torch.cat([torch.ones(len(q_ids), dtype=torch.long),
-                                torch.zeros(q_pad_len, dtype=torch.long)])
+            q_padded = torch.cat([torch.full((q_pad_len,), pad_id, dtype=q_ids.dtype), q_ids])
+            q_mask = torch.cat([torch.zeros(q_pad_len, dtype=torch.long),
+                                torch.ones(len(q_ids), dtype=torch.long)])
 
             # Pad answers (right-pad)
             a_pad_len = max_a_len - len(a_ids)

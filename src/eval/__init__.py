@@ -1,4 +1,4 @@
 from .evaluator import Evaluator
-from .metrics import extract_answer, numerical_compare
+from .metrics import check_answer
 
-__all__ = ["Evaluator", "extract_answer", "numerical_compare"]
+__all__ = ["Evaluator", "check_answer"]

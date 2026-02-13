@@ -12,7 +12,6 @@ from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
 from tqdm import tqdm
 
 from ..model.latent_gemma import LatentReasoningModel
-from ..model.bridge import BridgeLayer
 from .curriculum import CurriculumScheduler
 
 try:
@@ -127,7 +126,7 @@ class LatentReasoningTrainer:
 
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={Gemma2DecoderLayer, BridgeLayer},
+            transformer_layer_cls={Gemma2DecoderLayer},
         )
 
         strategy_map = {
@@ -192,7 +191,7 @@ class LatentReasoningTrainer:
         from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
-            transformer_layer_cls={Gemma2DecoderLayer, BridgeLayer},
+            transformer_layer_cls={Gemma2DecoderLayer},
         )
 
         shard_output = None  # Can add custom output sharding if needed
@@ -217,32 +216,14 @@ class LatentReasoningTrainer:
     # ---- Optimizer ----
 
     def _build_optimizer(self):
-        """Build AdamW with separate param groups for transformer and bridge."""
-        bridge_params = []
-        transformer_params = []
+        """Build AdamW for all trainable parameters."""
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if "bridge" in name:
-                bridge_params.append(param)
-            else:
-                transformer_params.append(param)
-
-        param_groups = [
-            {
-                "params": transformer_params,
-                "lr": self.config.training.learning_rate,
-                "weight_decay": self.config.training.weight_decay,
-            },
-            {
-                "params": bridge_params,
-                "lr": self.config.training.learning_rate * 5,  # 5x for bridge
-                "weight_decay": 0.0,
-            },
-        ]
-
-        return torch.optim.AdamW(param_groups)
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=self.config.training.learning_rate,
+            weight_decay=self.config.training.weight_decay,
+        )
 
     # ---- DataLoader ----
 
@@ -415,8 +396,7 @@ class LatentReasoningTrainer:
                         "train/loss": accum_loss,
                         "train/perplexity": math.exp(min(accum_loss, 20)),
                         "train/grad_norm": grad_norm,
-                        "train/lr_transformer": lrs[0],
-                        "train/lr_bridge": lrs[1] if len(lrs) > 1 else lrs[0],
+                        "train/lr": lrs[0],
                         "train/epoch": epoch,
                         "train/samples_per_sec": samples_per_sec,
                         "curriculum/K": K,

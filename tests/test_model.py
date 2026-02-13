@@ -1,8 +1,8 @@
 """Unit tests for the three-phase latent reasoning model.
 
 These tests use the real Gemma 2 2B model to verify:
-- Output shapes at each phase
-- Gradient flow through bridge and transformer
+- Output shapes at each phase (phase 2 appends K positions)
+- Gradient flow through transformer
 - Frozen params (embedding, lm_head) have no gradients
 - Annealing behavior at p=1.0 vs p=0.0
 - Overfitting on a single batch
@@ -17,14 +17,12 @@ from omegaconf import OmegaConf
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.model.latent_gemma import LatentReasoningModel
-from src.model.bridge import BridgeLayer
 from src.training.curriculum import CurriculumScheduler
 
 # Minimal config for testing
 TEST_CONFIG = OmegaConf.create({
     "model": {
         "name": "MCES10/maths-problems-gemma-2-2b-it",
-        "bridge": {"identity_init_scale": 0.01},
     },
     "latent": {
         "K": 8,
@@ -33,37 +31,6 @@ TEST_CONFIG = OmegaConf.create({
         "p_anneal_steps": 50000,
     },
 })
-
-
-# --- Bridge Layer Tests (no GPU needed) ---
-
-class TestBridgeLayer:
-    def test_output_shape(self):
-        d_model = 64
-        bridge = BridgeLayer(d_model=d_model)
-        x = torch.randn(2, 10, d_model)
-        out = bridge(x)
-        assert out.shape == (2, 10, d_model)
-
-    def test_near_identity_at_init(self):
-        d_model = 64
-        bridge = BridgeLayer(d_model=d_model, identity_init_scale=0.001)
-        x = torch.randn(2, 10, d_model)
-        out = bridge(x)
-        # With near-identity init and LayerNorm, output should be close to LayerNorm(x)
-        ln = bridge.layer_norm(x)
-        diff = (out - ln).abs().max().item()
-        assert diff < 0.5, f"Bridge output too far from near-identity: max diff = {diff}"
-
-    def test_gradient_flow(self):
-        d_model = 64
-        bridge = BridgeLayer(d_model=d_model)
-        x = torch.randn(2, 10, d_model, requires_grad=True)
-        out = bridge(x)
-        loss = out.sum()
-        loss.backward()
-        assert x.grad is not None
-        assert bridge.linear.weight.grad is not None
 
 
 # --- Curriculum Scheduler Tests ---
@@ -124,42 +91,33 @@ class TestLatentReasoningModel:
         assert hidden.shape == (B, q_len, model.d_model)
 
     def test_phase2_shape(self, model, dummy_batch):
-        """Phase 2 output should preserve shape."""
+        """Phase 2 should append K positions: [B, q_len + K, d_model]."""
         hidden = model.phase1_encode(dummy_batch["question_ids"])
-        latent = model.phase2_latent_steps(hidden, dummy_batch["question_mask"], K=2, p=0.5)
-        assert latent.shape == hidden.shape
+        K = 2
+        latent, mask = model.phase2_latent_steps(
+            hidden, dummy_batch["question_mask"], K=K, p=0.5
+        )
+        B, q_len = dummy_batch["question_ids"].shape
+        assert latent.shape == (B, q_len + K, model.d_model)
+        assert mask.shape == (B, q_len + K)
 
     def test_forward_output(self, model, dummy_batch):
-        """Full forward should return loss and logits."""
+        """Full forward should return loss and logits with correct shapes."""
+        K = 2
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(
                 question_ids=dummy_batch["question_ids"],
                 question_mask=dummy_batch["question_mask"],
                 answer_ids=dummy_batch["answer_ids"],
                 answer_mask=dummy_batch["answer_mask"],
-                K=2,
+                K=K,
                 p=0.5,
             )
         assert "loss" in outputs
         assert "logits" in outputs
         assert outputs["loss"].ndim == 0  # scalar
-        assert outputs["logits"].shape[0] == dummy_batch["answer_ids"].shape[0]
-
-    def test_gradient_flow_bridge(self, model, dummy_batch):
-        """Verify gradients flow through bridge after backward."""
-        model.zero_grad()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(
-                question_ids=dummy_batch["question_ids"],
-                question_mask=dummy_batch["question_mask"],
-                answer_ids=dummy_batch["answer_ids"],
-                answer_mask=dummy_batch["answer_mask"],
-                K=2,
-                p=0.5,
-            )
-        outputs["loss"].backward()
-        assert model.bridge.linear.weight.grad is not None
-        assert model.bridge.linear.weight.grad.abs().sum() > 0
+        B, a_len = dummy_batch["answer_ids"].shape
+        assert outputs["logits"].shape == (B, a_len - 1, model.lm_head.out_features)
 
     def test_frozen_params(self, model, dummy_batch):
         """Embedding and lm_head should have no gradients."""
@@ -175,6 +133,22 @@ class TestLatentReasoningModel:
             )
         outputs["loss"].backward()
         assert model.embed_tokens.weight.grad is None
+
+    def test_answer_token_grad(self, model, dummy_batch):
+        """The <answer> token embedding should receive gradients."""
+        model.zero_grad()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(
+                question_ids=dummy_batch["question_ids"],
+                question_mask=dummy_batch["question_mask"],
+                answer_ids=dummy_batch["answer_ids"],
+                answer_mask=dummy_batch["answer_mask"],
+                K=2,
+                p=0.5,
+            )
+        outputs["loss"].backward()
+        assert model.answer_token_emb.grad is not None
+        assert model.answer_token_emb.grad.abs().sum() > 0
 
     def test_generate_answer(self, model, dummy_batch):
         """generate_answer should return token IDs."""
@@ -232,7 +206,6 @@ class TestOverfitting:
             "answer_mask": torch.ones(B, a_len, dtype=torch.long, device="cuda"),
         }
 
-        # Only optimize bridge + a few transformer params for speed
         optimizer = torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
             lr=1e-4,

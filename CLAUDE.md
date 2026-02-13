@@ -30,7 +30,7 @@ python scripts/evaluate.py --config configs/base.yaml --checkpoint checkpoints/s
 
 # Tests
 pytest tests/                    # all tests (GPU tests skip if no CUDA)
-pytest tests/test_model.py -k "TestBridgeLayer"         # bridge tests (no GPU needed)
+pytest tests/test_model.py -k "TestCurriculumScheduler"  # curriculum tests (no GPU needed)
 pytest tests/test_model.py -k "TestCurriculumScheduler"  # curriculum tests (no GPU needed)
 pytest tests/test_model.py -k "TestLatentReasoningModel"  # full model tests (needs GPU)
 ```
@@ -39,30 +39,35 @@ pytest tests/test_model.py -k "TestLatentReasoningModel"  # full model tests (ne
 
 The model (`src/model/latent_gemma.py:LatentReasoningModel`) wraps the base Gemma 2 model with a three-phase forward pass:
 
-1. **Phase 1 — Encode** (`phase1_encode`): Embeds question tokens via the frozen embedding matrix (scaled by √d_model).
-2. **Phase 2 — Latent Steps** (`phase2_latent_steps`): Runs K recurrent iterations through the transformer. Each step uses annealed interpolation: `input = token_emb * p + latent_state * (1-p)`, where the token_emb path is **detached** (no gradient). Gradients flow only through the latent path. Uses `torch.utils.checkpoint` per step.
-3. **Phase 3 — Decode** (`phase3_decode`): Bridge layer maps latent states back toward token manifold, then runs teacher-forced decoding through the **frozen** transformer to produce answer logits. Loss is standard cross-entropy on answer tokens.
+1. **Phase 1 — Encode** (`phase1_encode`): Embeds question tokens via the embedding matrix (scaled by √d_model). Questions are **left-padded** so real tokens get contiguous RoPE positions.
+2. **Phase 2 — Latent Steps** (`phase2_latent_steps`): **Autoregressive appending** — each of K steps runs the transformer, takes the last position's hidden state, blends it with a detached token embedding (argmax → re-embed), and appends the result. Output grows from `[B, q_len, d_model]` to `[B, q_len + K, d_model]`. Gradients flow only through the latent path (the `(1-p)` branch). Uses `torch.utils.checkpoint` per step.
+3. **`<answer>` token** — A learned embedding (`answer_token_emb`) is appended after the K thought vectors to signal the transition to answer generation.
+4. **Phase 3 — Decode** (`phase3_decode`): The prefix (question + thoughts + `<answer>`) is concatenated with teacher-forced answer embeddings. After the transformer pass, answer-position hidden states are projected directly through the frozen lm_head to produce logits. Loss is standard cross-entropy on answer tokens.
 
 ### Trainable vs Frozen
 
 | Component | Status |
 |-----------|--------|
 | Embedding matrix | Frozen always |
-| lm_head (unembedding) | Frozen always |
-| Transformer weights | Trainable during Phase 2 latent steps, frozen during Phase 3 decode (but gradients flow through activations) |
-| Bridge layer (`src/model/bridge.py`) | Trainable (LayerNorm → Linear, initialized near-identity) |
+| lm_head (unembedding) | Frozen always (tied to embedding) |
+| Transformer weights | Trainable |
+| `answer_token_emb` | Trainable (learned transition marker) |
 
 ### Curriculum (`src/training/curriculum.py`)
 
-K (number of latent iterations) is fixed at 8 for all training (set via `latent.K` in config). The only schedule is **p annealing**: linearly interpolates from p_start (0.9) → p_end (0.0) over p_anneal_steps. At p=0.9 the model operates near-standard decoding; at p=0.0 it's pure latent reasoning.
+K (number of latent iterations) is fixed at 8 for all training (set via `latent.K` in config). The only schedule is **p annealing**: linearly interpolates from p_start (0.9) → p_end (0.0) over p_anneal_steps. At p=0.9 the model operates near-standard autoregressive generation; at p=0.0 it appends continuous "thought vectors."
 
 ### Key Design Detail: Gemma 2 Normalizer
 
 Gemma 2 internally multiplies `inputs_embeds` by √d_model. The model pre-divides by this normalizer in `_run_transformer` to cancel the scaling, and pre-multiplies raw embeddings by the normalizer in `phase1_encode`. This is critical — incorrect scaling breaks the latent loop.
 
+### Key Design Detail: Left-Padded Questions
+
+Questions are left-padded in the collator (`src/data/collator.py`). HuggingFace Gemma 2 computes `position_ids` from `attention_mask`, so left-padded `mask = [0, 0, 1, 1, 1]` yields contiguous positions `[0, 1, 2]` for real tokens. This eliminates RoPE position gaps between question tokens and appended thought vectors.
+
 ## Code Layout
 
-- `src/model/` — Model definition (`LatentReasoningModel`) and bridge layer
+- `src/model/` — Model definition (`LatentReasoningModel`)
 - `src/training/` — Trainer (FSDP for both CUDA and XLA/TPU) and curriculum scheduler
 - `src/data/` — `BigMathDataset` (loads `SynthLabsAI/Big-Math-RL-Verified`) and collator (pads question/answer independently)
 - `src/eval/` — Evaluator (GSM8K, MATH benchmarks) and answer extraction/comparison metrics
@@ -84,4 +89,4 @@ The trainer and model support both CUDA/NCCL and XLA/TPU backends. Backend is se
 
 ## Dataset
 
-Training: `SynthLabsAI/Big-Math-RL-Verified` (~250K math problems with verified answers). Only question text and final numerical answer are used — no chain-of-thought needed. Question and answer are tokenized and padded separately by the collator.
+Training: `SynthLabsAI/Big-Math-RL-Verified` (~250K math problems with verified answers). Only question text and final numerical answer are used — no chain-of-thought needed. Question and answer are tokenized and padded separately by the collator (questions left-padded, answers right-padded).

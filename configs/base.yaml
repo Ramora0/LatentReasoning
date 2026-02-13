@@ -3,8 +3,6 @@ paths:
 
 model:
   name: "MCES10/maths-problems-gemma-2-2b-it"
-  bridge:
-    identity_init_scale: 0.01
 
 latent:
   K: 8
