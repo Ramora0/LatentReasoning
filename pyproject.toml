@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "latent-reasoning"
+version = "0.1.0"
+description = "Latent reasoning training pipeline for Gemma 2 2B"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.44.0",
+    "datasets>=2.20.0",
+    "accelerate>=0.33.0",
+    "wandb",
+    "omegaconf",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+tpu = [
+    "torch_xla>=2.1.0",
+]
+dev = [
+    "pytest",
+    "pytest-timeout",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
