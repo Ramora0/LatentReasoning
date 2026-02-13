@@ -78,20 +78,16 @@ def main():
     print(f"Scratch directory: {scratch_dir}\n")
 
     # 1. Base model
-    print("[1/4] Model: MCES10/maths-problems-gemma-2-2b-it")
+    print("[1/3] Model: MCES10/maths-problems-gemma-2-2b-it")
     download_model("MCES10/maths-problems-gemma-2-2b-it", scratch_dir)
 
     # 2. Training dataset
-    print("[2/4] Training data: SynthLabsAI/Big-Math-RL-Verified")
+    print("[2/3] Training data: SynthLabsAI/Big-Math-RL-Verified")
     download_dataset("SynthLabsAI/Big-Math-RL-Verified", scratch_dir)
 
     # 3. GSM8K eval dataset
-    print("[3/4] Eval data: gsm8k")
+    print("[3/3] Eval data: gsm8k")
     download_dataset("gsm8k", scratch_dir, config_name="main")
-
-    # 4. MATH eval dataset
-    print("[4/4] Eval data: hendrycks/competition_math")
-    download_dataset("hendrycks/competition_math", scratch_dir)
 
     print(f"\nAll downloads complete.")
     print(f"  Models:   {os.path.join(scratch_dir, 'models')}")

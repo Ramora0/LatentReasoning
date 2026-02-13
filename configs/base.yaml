@@ -40,7 +40,7 @@ data:
   max_answer_tokens: 64
 
 eval:
-  benchmarks: [gsm8k, math]
+  benchmarks: [gsm8k]
   eval_every_steps: 2000
   max_new_tokens: 64
 

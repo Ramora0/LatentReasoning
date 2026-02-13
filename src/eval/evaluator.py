@@ -8,7 +8,7 @@ from .metrics import extract_answer, numerical_compare
 
 
 class Evaluator:
-    """Evaluate latent reasoning model on GSM8K and MATH benchmarks."""
+    """Evaluate latent reasoning model on GSM8K benchmark."""
 
     def __init__(self, config, tokenizer: PreTrainedTokenizer, device: torch.device,
                  eval_data_dir: str = None):
@@ -26,9 +26,6 @@ class Evaluator:
             if benchmark == "gsm8k":
                 acc = self._eval_gsm8k(model, K, p)
                 results["gsm8k_accuracy"] = acc
-            elif benchmark == "math":
-                acc = self._eval_math(model, K, p)
-                results["math_accuracy"] = acc
         return results
 
     def _load_dataset(self, local_subdir, hf_name, hf_config=None, split="test"):
@@ -50,18 +47,6 @@ class Evaluator:
             question_key="question",
             answer_key="answer",
             benchmark_name="GSM8K",
-        )
-
-    def _eval_math(self, model, K: int, p: float) -> float:
-        """Evaluate on MATH test set."""
-        dataset = self._load_dataset(
-            "competition_math", "hendrycks/competition_math"
-        )
-        return self._eval_dataset(
-            model, dataset, K, p,
-            question_key="problem",
-            answer_key="solution",
-            benchmark_name="MATH",
         )
 
     def _eval_dataset(
