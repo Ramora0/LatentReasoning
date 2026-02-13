@@ -11,8 +11,8 @@ latent:
   p_anneal_steps: 50000
 
 training:
-  batch_size_per_gpu: 4
-  gradient_accumulation_steps: 4
+  batch_size_per_gpu: 8
+  gradient_accumulation_steps: 2
   max_steps: 60000
   learning_rate: 2e-5
   weight_decay: 0.01
