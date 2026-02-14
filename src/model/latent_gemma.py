@@ -68,8 +68,12 @@ class LatentReasoningModel(nn.Module):
         # Per-step gradient norms populated by backward hooks in phase2
         self._latent_grad_norms = {}
 
-        # Enable gradient checkpointing on the base model
-        if hasattr(self.base_model, "gradient_checkpointing_enable"):
+        # Enable gradient checkpointing on the base model.
+        # On XLA, HF's internal checkpointing uses torch.utils.checkpoint which
+        # crashes (getattr(torch, "xla") doesn't exist). We already wrap the
+        # entire phase2 with torch_xla's checkpoint, so skip HF's per-layer
+        # checkpointing on XLA entirely.
+        if not self.use_xla and hasattr(self.base_model, "gradient_checkpointing_enable"):
             self.base_model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False}
             )
