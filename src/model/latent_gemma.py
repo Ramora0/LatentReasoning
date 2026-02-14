@@ -1,4 +1,5 @@
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -182,6 +183,8 @@ class LatentReasoningModel(nn.Module):
         self._disable_layer_grad_checkpointing()
         try:
             # Step 0: full pass, build KV cache
+            t0 = time.perf_counter()
+            print(f"  [phase2] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
             hidden_out, kv_cache = self._run_transformer(
                 hidden_states, attention_mask, use_cache=True,
             )
@@ -197,6 +200,7 @@ class LatentReasoningModel(nn.Module):
             if blended.requires_grad:
                 blended.register_hook(_make_grad_hook(0))
             thoughts.append(blended)
+            print(f"  [phase2] step 0/{K}: thought appended ({time.perf_counter()-t0:.2f}s)", flush=True)
 
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -205,6 +209,7 @@ class LatentReasoningModel(nn.Module):
 
             # Steps 1..K-1: single-token passes with KV cache
             for k in range(1, K):
+                tk = time.perf_counter()
                 hidden_out, kv_cache = self._run_transformer(
                     blended, attention_mask, past_key_values=kv_cache, use_cache=True,
                 )
@@ -219,6 +224,7 @@ class LatentReasoningModel(nn.Module):
                 if blended.requires_grad:
                     blended.register_hook(_make_grad_hook(k))
                 thoughts.append(blended)
+                print(f"  [phase2] step {k}/{K}: thought appended ({time.perf_counter()-tk:.2f}s)", flush=True)
 
                 attention_mask = torch.cat(
                     [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -229,10 +235,14 @@ class LatentReasoningModel(nn.Module):
 
         return torch.cat(thoughts, dim=1), kv_cache  # [B, K, d_model]
 
-    def _phase2_for_checkpoint(self, hidden_states, attention_mask, p_tensor, K_tensor):
-        """Wrapper for torch.checkpoint — returns only thoughts, not KV cache."""
+    def _phase2_for_checkpoint(self, hidden_states, attention_mask):
+        """Wrapper for torch.checkpoint — returns only thoughts, not KV cache.
+
+        Reads p and K from instance attributes (_ckpt_p, _ckpt_K) rather than
+        checkpoint inputs, to avoid XLA gradient shape mismatches on scalars.
+        """
         thoughts, _ = self._phase2_core(
-            hidden_states, attention_mask, p_tensor.item(), int(K_tensor.item()),
+            hidden_states, attention_mask, self._ckpt_p, self._ckpt_K,
         )
         return thoughts
 
@@ -272,13 +282,17 @@ class LatentReasoningModel(nn.Module):
         if torch.is_grad_enabled():
             # Checkpoint all of phase 2: no activations stored during forward.
             # Backward recomputes phase 2 (with KV cache) to get gradients.
+            # Store p and K as instance attrs so _phase2_for_checkpoint can
+            # read them without them being checkpoint tensor inputs (avoids
+            # XLA gradient shape mismatches on scalar tensors).
+            self._ckpt_p = p
+            self._ckpt_K = K
             checkpoint_kwargs = {}
             if not self.use_xla:
                 checkpoint_kwargs["use_reentrant"] = False
             thoughts = self._checkpoint_fn(
                 self._phase2_for_checkpoint,
                 hidden_states, attention_mask,
-                torch.tensor(p), torch.tensor(K, dtype=torch.long),
                 **checkpoint_kwargs,
             )
             kv_cache = None
@@ -397,6 +411,8 @@ class LatentReasoningModel(nn.Module):
             dict with 'loss' and 'logits'
         """
         # Phase 1: Encode
+        t_start = time.perf_counter()
+        print(f"[forward] Phase 1: Encoding (q_len={question_ids.shape[1]}, batch={question_ids.shape[0]})...", flush=True)
         hidden_states = self.phase1_encode(question_ids)
 
         # Insert <thinking> token before latent steps
@@ -408,11 +424,15 @@ class LatentReasoningModel(nn.Module):
             [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
             dim=1,
         )
+        print(f"[forward] Phase 1: done ({time.perf_counter()-t_start:.2f}s)", flush=True)
 
         # Phase 2: Latent steps (KV cache used internally, detached during training)
+        t_phase2 = time.perf_counter()
+        print(f"[forward] Phase 2: Latent steps (K={K}, p={p:.3f})...", flush=True)
         hidden_states, extended_mask, _ = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )
+        print(f"[forward] Phase 2: done ({time.perf_counter()-t_phase2:.2f}s)", flush=True)
 
         # Insert <answer> token
         answer_marker = self.answer_token_emb.expand(B, -1, -1)  # [B, 1, d_model]
@@ -425,9 +445,13 @@ class LatentReasoningModel(nn.Module):
         # Phase 3: Decode — full sequence with gradient checkpointing (no KV cache).
         # Phase3 needs gradients through all positions for the answer loss, and
         # gradient checkpointing keeps memory bounded.
+        t_phase3 = time.perf_counter()
+        print(f"[forward] Phase 3: Decoding (a_len={answer_ids.shape[1]})...", flush=True)
         loss, logits = self.phase3_decode(
             hidden_states, extended_mask, answer_ids, answer_mask,
         )
+        print(f"[forward] Phase 3: done ({time.perf_counter()-t_phase3:.2f}s)", flush=True)
+        print(f"[forward] Total forward: {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
 
         return {"loss": loss, "logits": logits}
 
