@@ -95,12 +95,13 @@ class TestLatentReasoningModel:
         """Phase 2 should append K positions: [B, q_len + K, d_model]."""
         hidden = model.phase1_encode(dummy_batch["question_ids"])
         K = 2
-        latent, mask = model.phase2_latent_steps(
+        latent, mask, kv_cache = model.phase2_latent_steps(
             hidden, dummy_batch["question_mask"], K=K, p=0.5
         )
         B, q_len = dummy_batch["question_ids"].shape
         assert latent.shape == (B, q_len + K, model.d_model)
         assert mask.shape == (B, q_len + K)
+        assert kv_cache is not None
 
     def test_forward_output(self, model, dummy_batch):
         """Full forward should return loss and logits with correct shapes."""
@@ -163,6 +164,29 @@ class TestLatentReasoningModel:
         assert generated.ndim == 2
         assert generated.shape[0] == dummy_batch["question_ids"].shape[0]
         assert generated.shape[1] <= 8
+
+    def test_kv_cache_gradient_flow(self, model, dummy_batch):
+        """Verify that gradients flow through the KV cache path."""
+        model.zero_grad()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(
+                question_ids=dummy_batch["question_ids"],
+                question_mask=dummy_batch["question_mask"],
+                answer_ids=dummy_batch["answer_ids"],
+                answer_mask=dummy_batch["answer_mask"],
+                K=2,
+                p=0.5,
+            )
+        outputs["loss"].backward()
+        # answer_token_emb should get gradients through the KV cache path
+        assert model.answer_token_emb.grad is not None
+        assert model.answer_token_emb.grad.abs().sum() > 0
+        # Transformer weights should also get gradients
+        some_layer_param = next(
+            p for p in model.base_model.model.layers[0].parameters() if p.requires_grad
+        )
+        assert some_layer_param.grad is not None
+        assert some_layer_param.grad.abs().sum() > 0
 
     def test_p_zero_pure_latent(self, model, dummy_batch):
         """At p=0.0, no token embedding should be blended in (pure latent)."""

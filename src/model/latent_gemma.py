@@ -3,7 +3,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class LatentReasoningModel(nn.Module):
@@ -70,6 +69,18 @@ class LatentReasoningModel(nn.Module):
             self.base_model.config, "final_logit_softcapping", None
         )
 
+    def _disable_layer_grad_checkpointing(self):
+        """Disable per-layer gradient checkpointing to allow KV cache."""
+        self._saved_grad_ckpt = {}
+        for i, layer in enumerate(self.base_model.model.layers):
+            self._saved_grad_ckpt[i] = getattr(layer, 'gradient_checkpointing', False)
+            layer.gradient_checkpointing = False
+
+    def _restore_layer_grad_checkpointing(self):
+        """Restore per-layer gradient checkpointing flags."""
+        for i, layer in enumerate(self.base_model.model.layers):
+            layer.gradient_checkpointing = self._saved_grad_ckpt.get(i, False)
+
     @property
     def embed_tokens(self):
         return self.base_model.model.embed_tokens
@@ -82,17 +93,24 @@ class LatentReasoningModel(nn.Module):
     def transformer(self):
         return self.base_model.model
 
-    def _run_transformer(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
+    def _run_transformer(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor,
+                         past_key_values=None, use_cache=False):
         """Run inputs through the transformer, pre-dividing by normalizer.
 
         Gemma 2 internally multiplies inputs_embeds by sqrt(d_model). By pre-dividing,
         we cancel this scaling so our already-scaled embeddings pass through correctly.
+
+        When use_cache=True, returns (hidden_states, past_key_values).
+        Otherwise returns just hidden_states.
         """
         outputs = self.transformer(
             inputs_embeds=inputs_embeds / self.normalizer,
             attention_mask=attention_mask,
-            use_cache=False,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
+        if use_cache:
+            return outputs.last_hidden_state, outputs.past_key_values
         return outputs.last_hidden_state
 
     def phase1_encode(self, question_ids: torch.Tensor) -> torch.Tensor:
@@ -113,8 +131,11 @@ class LatentReasoningModel(nn.Module):
         attention_mask: torch.Tensor,
         K: int,
         p: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Phase 2: K autoregressive latent steps (each appends one position).
+    ) -> tuple[torch.Tensor, torch.Tensor, object]:
+        """Phase 2: K autoregressive latent steps with KV cache.
+
+        Step 0 runs the full transformer on all input positions with use_cache=True.
+        Steps 1..K-1 each process only the new thought vector (1 token) with cached KV.
 
         Args:
             hidden_states: [B, q_len, d_model] from Phase 1
@@ -123,69 +144,75 @@ class LatentReasoningModel(nn.Module):
             p: interpolation weight (1.0 = pure token, 0.0 = pure latent)
 
         Returns:
-            (hidden_states, extended_mask):
+            (hidden_states, extended_mask, kv_cache):
                 hidden_states: [B, q_len + K, d_model]
                 extended_mask: [B, q_len + K]
+                kv_cache: past_key_values from transformer
         """
         B = hidden_states.shape[0]
         device = hidden_states.device
         self._latent_grad_norms = {}
+        thoughts = []
 
-        for k in range(K):
-            hidden_states = checkpoint(
-                self._latent_step,
-                hidden_states,
-                attention_mask,
-                torch.tensor(p),  # must be a tensor for checkpoint
-                use_reentrant=False,
+        self._disable_layer_grad_checkpointing()
+        try:
+            # Step 0: full pass over all input positions, build KV cache
+            hidden_out, kv_cache = self._run_transformer(
+                hidden_states, attention_mask, use_cache=True
             )
+            last_hidden = hidden_out[:, -1:, :]  # [B, 1, d_model]
 
-            # Register backward hook to capture gradient norm of thought vector k
-            step_idx = k
-            last_pos = hidden_states.shape[1] - 1
-            def _grad_hook(grad, step=step_idx, pos=last_pos):
-                self._latent_grad_norms[step] = grad[:, pos, :].norm().item()
-            hidden_states.register_hook(_grad_hook)
+            # Blend step 0
+            with torch.no_grad():
+                logits = self.lm_head(last_hidden)
+                token_ids = logits.argmax(dim=-1)
+                token_emb = self.embed_tokens(token_ids) * self.normalizer
+            blended = token_emb * p + last_hidden * (1 - p)
 
-            # Extend mask by one position (outside checkpoint)
+            def _make_grad_hook(step):
+                def _grad_hook(grad):
+                    self._latent_grad_norms[step] = grad.norm().item()
+                return _grad_hook
+            blended.register_hook(_make_grad_hook(0))
+            thoughts.append(blended)
+
+            # Extend mask for thought_0
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
                 dim=1,
             )
 
-        return hidden_states, attention_mask
+            # Steps 1..K-1: process only the new thought vector (1 token)
+            for k in range(1, K):
+                # Feed only the latest thought vector, with full mask
+                hidden_out, kv_cache = self._run_transformer(
+                    blended, attention_mask, past_key_values=kv_cache, use_cache=True
+                )
+                last_hidden = hidden_out[:, -1:, :]  # [B, 1, d_model]
 
-    def _latent_step(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        p_tensor: torch.Tensor,
-    ) -> torch.Tensor:
-        """Single latent iteration: transformer pass -> take last hidden -> blend -> append.
+                with torch.no_grad():
+                    logits = self.lm_head(last_hidden)
+                    token_ids = logits.argmax(dim=-1)
+                    token_emb = self.embed_tokens(token_ids) * self.normalizer
+                blended = token_emb * p + last_hidden * (1 - p)
 
-        Autoregressive: each step appends one new position.
-        Input:  [B, current_len, d_model]
-        Output: [B, current_len + 1, d_model]
-        """
-        p = p_tensor.item()
+                blended.register_hook(_make_grad_hook(k))
+                thoughts.append(blended)
 
-        # Run full transformer pass on current sequence
-        hidden_out = self._run_transformer(hidden_states, attention_mask)
+                # Extend mask for this thought
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+                    dim=1,
+                )
 
-        # Take last position's hidden state
-        last_hidden = hidden_out[:, -1:, :]  # [B, 1, d_model]
+        finally:
+            self._restore_layer_grad_checkpointing()
 
-        # Detached token path: decode last hidden to token, re-embed
-        with torch.no_grad():
-            logits = self.lm_head(last_hidden)
-            token_ids = logits.argmax(dim=-1)
-            token_emb = self.embed_tokens(token_ids) * self.normalizer
+        # Concatenate all thought vectors and append to original hidden_states
+        all_thoughts = torch.cat(thoughts, dim=1)  # [B, K, d_model]
+        hidden_states = torch.cat([hidden_states, all_thoughts], dim=1)
 
-        # Blend: gradients flow only through last_hidden (the (1-p) branch)
-        blended = token_emb * p + last_hidden * (1 - p)  # [B, 1, d_model]
-
-        # Append blended thought vector to sequence
-        return torch.cat([hidden_states, blended], dim=1)
+        return hidden_states, attention_mask, kv_cache
 
     def phase3_decode(
         self,
@@ -193,17 +220,23 @@ class LatentReasoningModel(nn.Module):
         prefix_mask: torch.Tensor,
         answer_ids: torch.Tensor,
         answer_mask: torch.Tensor,
+        kv_cache=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Phase 3: Teacher-forced answer decoding.
 
         The prefix (question + thought vectors + <answer> token) provides context.
         Answer hidden states are projected directly to vocabulary via lm_head.
 
+        When kv_cache is provided, only the <answer> token and answer embeddings are
+        processed (the prefix is already in the cache). Otherwise falls back to
+        processing the full concatenated sequence.
+
         Args:
             latent_states: [B, prefix_len, d_model] (question + K thoughts + <answer>)
             prefix_mask: [B, prefix_len]
             answer_ids: [B, a_len] answer token IDs
             answer_mask: [B, a_len]
+            kv_cache: optional past_key_values from phase2
 
         Returns:
             (loss, logits) where loss is CE on answer positions
@@ -211,20 +244,38 @@ class LatentReasoningModel(nn.Module):
         # Teacher-forced answer embeddings (shifted right: use all but last token as input)
         answer_embeds = self.embed_tokens(answer_ids[:, :-1]) * self.normalizer  # [B, a_len-1, d_model]
 
-        # Concatenate prefix with answer embeddings
-        decode_input = torch.cat([latent_states, answer_embeds], dim=1)
+        if kv_cache is not None:
+            # KV cache covers question + K thoughts (NOT the <answer> token).
+            # We need to process: <answer> token + answer_embeds
+            # The <answer> token is the last position in latent_states.
+            answer_marker = latent_states[:, -1:, :]  # [B, 1, d_model]
+            decode_input = torch.cat([answer_marker, answer_embeds], dim=1)
 
-        # Build attention mask for decode
-        decode_mask = torch.cat(
-            [prefix_mask, answer_mask[:, :-1]], dim=1
-        )
+            # Full attention mask must cover cached + new positions
+            decode_mask = torch.cat(
+                [prefix_mask, answer_mask[:, :-1]], dim=1
+            )
 
-        # Run through transformer (grads flow through activations)
-        hidden_out = self._run_transformer(decode_input, decode_mask)
+            self._disable_layer_grad_checkpointing()
+            try:
+                hidden_out = self._run_transformer(
+                    decode_input, decode_mask, past_key_values=kv_cache, use_cache=False
+                )
+            finally:
+                self._restore_layer_grad_checkpointing()
 
-        # Extract answer-position hidden states
-        prefix_len = latent_states.shape[1]
-        answer_hidden = hidden_out[:, prefix_len:, :]  # [B, a_len-1, d_model]
+            # Output covers only the new tokens: [<answer>, ans_0, ans_1, ...]
+            # Skip <answer> position, take answer positions
+            answer_hidden = hidden_out[:, 1:, :]  # [B, a_len-1, d_model]
+        else:
+            # Fallback: no cache, process full sequence
+            decode_input = torch.cat([latent_states, answer_embeds], dim=1)
+            decode_mask = torch.cat(
+                [prefix_mask, answer_mask[:, :-1]], dim=1
+            )
+            hidden_out = self._run_transformer(decode_input, decode_mask)
+            prefix_len = latent_states.shape[1]
+            answer_hidden = hidden_out[:, prefix_len:, :]  # [B, a_len-1, d_model]
 
         # Project directly to vocabulary
         logits = self.lm_head(answer_hidden)  # [B, a_len-1, vocab]
@@ -276,8 +327,8 @@ class LatentReasoningModel(nn.Module):
             dim=1,
         )
 
-        # Phase 2: Latent steps (autoregressive appending)
-        hidden_states, extended_mask = self.phase2_latent_steps(
+        # Phase 2: Latent steps with KV cache
+        hidden_states, extended_mask, kv_cache = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )
 
@@ -289,9 +340,10 @@ class LatentReasoningModel(nn.Module):
             dim=1,
         )
 
-        # Phase 3: Decode
+        # Phase 3: Decode with cached prefix
         loss, logits = self.phase3_decode(
-            hidden_states, extended_mask, answer_ids, answer_mask
+            hidden_states, extended_mask, answer_ids, answer_mask,
+            kv_cache=kv_cache,
         )
 
         return {"loss": loss, "logits": logits}
@@ -334,47 +386,54 @@ class LatentReasoningModel(nn.Module):
             dim=1,
         )
 
-        # Phase 2: Latent steps
-        hidden_states, extended_mask = self.phase2_latent_steps(
+        # Phase 2: Latent steps with KV cache
+        hidden_states, extended_mask, kv_cache = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )
 
-        # Insert <answer> token
+        # Process <answer> token through transformer with KV cache (1 token)
         answer_marker = self.answer_token_emb.expand(B, -1, -1)
-        current_input = torch.cat([hidden_states, answer_marker], dim=1)
         current_mask = torch.cat(
             [extended_mask, torch.ones(B, 1, dtype=extended_mask.dtype, device=device)],
             dim=1,
         )
+        hidden_out, kv_cache = self._run_transformer(
+            answer_marker, current_mask, past_key_values=kv_cache, use_cache=True
+        )
 
-        generated = []
+        # Get logits from <answer> position
+        last_hidden = hidden_out[:, -1:, :]
+        logits = self.lm_head(last_hidden)
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            logits = cap * torch.tanh(logits / cap)
 
-        for step in range(max_new_tokens):
-            # Run transformer on current sequence
-            hidden_out = self._run_transformer(current_input, current_mask)
+        next_token = logits.argmax(dim=-1)  # [B, 1]
+        generated = [next_token]
 
-            # Get logits for the last position
-            last_hidden = hidden_out[:, -1:, :]       # [B, 1, d_model]
-            logits = self.lm_head(last_hidden)         # [B, 1, vocab]
-
-            if self.final_logit_softcapping is not None:
-                cap = self.final_logit_softcapping
-                logits = cap * torch.tanh(logits / cap)
-
-            next_token = logits.argmax(dim=-1)  # [B, 1]
-            generated.append(next_token)
-
+        for step in range(1, max_new_tokens):
             # Check for EOS
             if eos_id is not None and (next_token == eos_id).all():
                 break
 
-            # Prepare next input: append new token embedding
+            # Process only the new token with cached KV
             next_emb = self.embed_tokens(next_token) * self.normalizer  # [B, 1, d_model]
-            current_input = torch.cat([current_input, next_emb], dim=1)
             current_mask = torch.cat(
                 [current_mask, torch.ones(B, 1, dtype=current_mask.dtype, device=device)],
                 dim=1,
             )
+            hidden_out, kv_cache = self._run_transformer(
+                next_emb, current_mask, past_key_values=kv_cache, use_cache=True
+            )
+
+            last_hidden = hidden_out[:, -1:, :]
+            logits = self.lm_head(last_hidden)
+            if self.final_logit_softcapping is not None:
+                cap = self.final_logit_softcapping
+                logits = cap * torch.tanh(logits / cap)
+
+            next_token = logits.argmax(dim=-1)
+            generated.append(next_token)
 
         if generated:
             return torch.cat(generated, dim=1)  # [B, num_generated]
