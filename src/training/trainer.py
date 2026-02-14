@@ -104,6 +104,21 @@ class LatentReasoningTrainer:
             self.optimizer, num_warmup, self.max_optimizer_steps
         )
 
+        # Convert sample-based intervals to optimizer-step-based intervals
+        samples_per_step = (
+            config.training.batch_size_per_gpu
+            * self.world_size
+            * self.grad_accum_steps
+        )
+        self.log_every = max(1, round(config.logging.log_every_samples / samples_per_step))
+        self.eval_every = max(1, round(config.eval.eval_every_samples / samples_per_step))
+        self.save_every = max(1, round(config.checkpointing.save_every_samples / samples_per_step))
+
+        if self.is_main:
+            print(f"  Effective batch size: {samples_per_step} samples/step")
+            print(f"  log every {self.log_every} steps, eval every {self.eval_every} steps, "
+                  f"save every {self.save_every} steps")
+
         # State
         self.optimizer_step = 0
 
@@ -323,11 +338,14 @@ class LatentReasoningTrainer:
         """
         self.model.train()
         max_steps = self.max_optimizer_steps
-        log_every = self.config.logging.log_every_steps
-        eval_every = self.config.eval.eval_every_steps
-        save_every = self.config.checkpointing.save_every_steps
+        log_every = self.log_every
+        eval_every = self.eval_every
+        save_every = self.save_every
 
-        accum_loss = 0.0
+        accum_loss = 0.0       # loss within current grad-accum window
+        log_loss = 0.0         # loss accumulated over logging window
+        log_grad_norm = 0.0    # grad_norm accumulated over logging window
+        log_steps = 0          # optimizer steps since last log
         micro_step = 0  # counts forward passes within current accumulation window
         step_start_time = time.monotonic()
 
@@ -352,6 +370,10 @@ class LatentReasoningTrainer:
                 epoch_loader = self.dataloader
 
             for batch in epoch_loader:
+                # Skip empty batches (all samples discarded by length filter)
+                if batch is None:
+                    continue
+
                 # Move batch to device (MpDeviceLoader already does this for XLA)
                 if not self.use_xla:
                     batch = {k: v.to(self.device) for k, v in batch.items()}
@@ -395,24 +417,33 @@ class LatentReasoningTrainer:
                     self.optimizer.zero_grad()
                     self.optimizer_step += 1
 
+                    # Accumulate stats for logging window
+                    log_loss += accum_loss
+                    log_grad_norm += grad_norm
+                    log_steps += 1
+                    accum_loss = 0.0
+
                     # Logging (based on optimizer steps)
                     if self.is_main and self.optimizer_step % log_every == 0:
+                        avg_loss = log_loss / log_steps
+                        avg_grad_norm = log_grad_norm / log_steps
                         step_time = time.monotonic() - step_start_time
                         samples_per_sec = (
-                            log_every * self.grad_accum_steps
+                            log_steps * self.grad_accum_steps
                             * self.config.training.batch_size_per_gpu
                             * self.world_size / step_time
                         )
                         lrs = self.scheduler.get_last_lr()
                         log_dict = {
-                            "train/loss": accum_loss,
-                            "train/perplexity": math.exp(min(accum_loss, 20)),
-                            "train/grad_norm": grad_norm,
+                            "train/loss": avg_loss,
+                            "train/perplexity": math.exp(min(avg_loss, 20)),
+                            "train/grad_norm": avg_grad_norm,
                             "train/lr": lrs[0],
                             "train/epoch": epoch,
                             "train/samples_per_sec": samples_per_sec,
                             "curriculum/K": K,
                             "curriculum/p": p,
+                            "data/question_discard_rate": self.train_dataset.discard_rate,
                         }
                         # Per-step latent gradient norms
                         base = self.model
@@ -430,10 +461,11 @@ class LatentReasoningTrainer:
                             torch.cuda.reset_peak_memory_stats(self.device)
                         if wandb is not None and wandb.run is not None:
                             wandb.log(log_dict, step=self.optimizer_step)
-                        pbar.set_postfix(loss=f"{accum_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+                        pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+                        log_loss = 0.0
+                        log_grad_norm = 0.0
+                        log_steps = 0
                         step_start_time = time.monotonic()
-
-                    accum_loss = 0.0
 
                     # Evaluation
                     if self.optimizer_step % eval_every == 0 and self.evaluator is not None:

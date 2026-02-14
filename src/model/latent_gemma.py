@@ -38,10 +38,18 @@ class LatentReasoningModel(nn.Module):
 
         # All transformer layer params stay trainable (requires_grad=True by default)
 
-        # Learned <answer> token inserted between thought vectors and answer decoding
-        # Initialize from the embedding of "answer" (scaled by normalizer) so it
-        # starts at the same magnitude as all other positions in the prefix.
+        # Learned transition tokens initialized from semantic embeddings (scaled by
+        # normalizer) so they start at the same magnitude as all other positions.
         _tokenizer = AutoTokenizer.from_pretrained(config.model.name)
+
+        # <thinking> token inserted between question encoding and latent steps
+        _thinking_id = _tokenizer.encode("thinking", add_special_tokens=False)[0]
+        _thinking_emb = self.base_model.model.embed_tokens.weight[_thinking_id].detach().clone()
+        self.thinking_token_emb = nn.Parameter(
+            (_thinking_emb * self.normalizer).reshape(1, 1, self.d_model)
+        )
+
+        # <answer> token inserted between thought vectors and answer decoding
         _answer_id = _tokenizer.encode("answer", add_special_tokens=False)[0]
         _init_emb = self.base_model.model.embed_tokens.weight[_answer_id].detach().clone()
         self.answer_token_emb = nn.Parameter(
@@ -258,14 +266,22 @@ class LatentReasoningModel(nn.Module):
         # Phase 1: Encode
         hidden_states = self.phase1_encode(question_ids)
 
+        # Insert <thinking> token before latent steps
+        B = hidden_states.shape[0]
+        device = hidden_states.device
+        thinking_marker = self.thinking_token_emb.expand(B, -1, -1)  # [B, 1, d_model]
+        hidden_states = torch.cat([hidden_states, thinking_marker], dim=1)
+        question_mask = torch.cat(
+            [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
+            dim=1,
+        )
+
         # Phase 2: Latent steps (autoregressive appending)
         hidden_states, extended_mask = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )
 
         # Insert <answer> token
-        B = hidden_states.shape[0]
-        device = hidden_states.device
         answer_marker = self.answer_token_emb.expand(B, -1, -1)  # [B, 1, d_model]
         hidden_states = torch.cat([hidden_states, answer_marker], dim=1)
         extended_mask = torch.cat(
@@ -304,9 +320,21 @@ class LatentReasoningModel(nn.Module):
         B = question_ids.shape[0]
         device = question_ids.device
         eos_id = self.base_model.config.eos_token_id
+        if isinstance(eos_id, list):
+            eos_id = eos_id[0]
 
-        # Phase 1 + Phase 2
+        # Phase 1: Encode
         hidden_states = self.phase1_encode(question_ids)
+
+        # Insert <thinking> token
+        thinking_marker = self.thinking_token_emb.expand(B, -1, -1)
+        hidden_states = torch.cat([hidden_states, thinking_marker], dim=1)
+        question_mask = torch.cat(
+            [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
+            dim=1,
+        )
+
+        # Phase 2: Latent steps
         hidden_states, extended_mask = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )

@@ -9,7 +9,12 @@ class LatentReasoningCollator:
 
     tokenizer: PreTrainedTokenizer
 
-    def __call__(self, batch: list[dict]) -> dict:
+    def __call__(self, batch: list[dict]) -> dict | None:
+        # Filter out discarded samples (None from dataset)
+        batch = [item for item in batch if item is not None]
+        if not batch:
+            return None
+
         # Find max lengths in this batch
         max_q_len = max(item["question_len"] for item in batch)
         max_a_len = max(item["answer_len"] for item in batch)

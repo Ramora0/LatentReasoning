@@ -17,6 +17,8 @@ class BigMathDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_question_tokens = max_question_tokens
         self.max_answer_tokens = max_answer_tokens
+        self._total_seen = 0
+        self._discarded = 0
 
         if data_dir is not None:
             from datasets import load_from_disk
@@ -32,20 +34,33 @@ class BigMathDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> dict:
+    @property
+    def discard_rate(self) -> float:
+        """Fraction of samples discarded due to question length."""
+        if self._total_seen == 0:
+            return 0.0
+        return self._discarded / self._total_seen
+
+    def __getitem__(self, idx: int) -> dict | None:
         item = self.data[idx]
 
         question = item["problem"]
         answer = item["answer"]
 
+        self._total_seen += 1
+
         question_enc = self.tokenizer(
             question,
-            truncation=True,
-            max_length=self.max_question_tokens,
+            truncation=False,
             add_special_tokens=True,
             return_tensors="pt",
         )
         question_ids = question_enc["input_ids"].squeeze(0)
+
+        # Discard questions that exceed the max length rather than truncating
+        if len(question_ids) > self.max_question_tokens:
+            self._discarded += 1
+            return None
 
         answer_enc = self.tokenizer(
             answer,
