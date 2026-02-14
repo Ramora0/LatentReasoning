@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 class LatentReasoningModel(nn.Module):
@@ -20,6 +20,11 @@ class LatentReasoningModel(nn.Module):
         # XLA/TPU works best with eager attention; CUDA benefits from SDPA
         backend = getattr(config.distributed, "backend", "cuda")
         self.use_xla = backend == "xla"
+        if self.use_xla:
+            from torch_xla.utils.checkpoint import checkpoint as _xla_checkpoint
+            self._checkpoint_fn = _xla_checkpoint
+        else:
+            self._checkpoint_fn = _torch_checkpoint
         attn_impl = "eager" if self.use_xla else "sdpa"
 
         # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
@@ -249,12 +254,14 @@ class LatentReasoningModel(nn.Module):
         if torch.is_grad_enabled():
             # Checkpoint all of phase 2: no activations stored during forward.
             # Backward recomputes phase 2 (with KV cache) to get gradients.
-            thoughts = torch_checkpoint(
+            checkpoint_kwargs = {}
+            if not self.use_xla:
+                checkpoint_kwargs["use_reentrant"] = False
+            thoughts = self._checkpoint_fn(
                 self._phase2_for_checkpoint,
                 hidden_states, attention_mask,
                 torch.tensor(p), torch.tensor(K, dtype=torch.long),
-                use_reentrant=False,
-                preserve_rng_state=not hidden_states.device.type == "xla",
+                **checkpoint_kwargs,
             )
             kv_cache = None
         else:
