@@ -1,110 +1,38 @@
 #!/usr/bin/env python3
-"""Show memory and compute utilization for all TPU VMs in a GCP project.
+"""Show memory and compute utilization for all local TPU chips.
 
-Uses the Cloud Monitoring API (via gcloud auth) to query TPU metrics,
-and gcloud CLI to list TPU VMs. No extra pip packages required.
+Run this directly on the TPU VM. Queries the libtpu Prometheus metrics
+endpoint at localhost:8431, plus host memory from /proc/meminfo.
 
 Usage:
-    python scripts/tpu_utilization.py                          # all zones
-    python scripts/tpu_utilization.py --zone us-central2-b     # specific zone
-    python scripts/tpu_utilization.py --watch 5                # refresh every 5s
+    python scripts/tpu_utilization.py              # one-shot
+    python scripts/tpu_utilization.py --watch 5    # refresh every 5s
+    python scripts/tpu_utilization.py --raw        # dump all TPU-related metrics
 """
 
 import argparse
-import json
-import subprocess
+import os
+import re
 import sys
 import time
-from datetime import datetime, timezone, timedelta
-
-# TPU zones to scan if none specified
-TPU_ZONES = [
-    "us-central1-a", "us-central1-b", "us-central1-c",
-    "us-central2-b",
-    "us-east1-d", "us-east5-a", "us-east5-b", "us-east5-c",
-    "europe-west4-a", "europe-west4-b",
-    "asia-east1-c",
-]
+import urllib.request
+from datetime import datetime
 
 
-def run_cmd(cmd, timeout=30):
-    """Run a shell command and return stdout, or None on failure."""
+METRICS_URL = "http://localhost:8431/metrics"
+
+
+def fetch_metrics():
+    """Fetch Prometheus metrics from the local libtpu endpoint."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        return None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+        with urllib.request.urlopen(METRICS_URL, timeout=5) as resp:
+            return resp.read().decode("utf-8")
+    except Exception as e:
         return None
 
 
-def get_project():
-    return run_cmd(["gcloud", "config", "get-value", "project"])
-
-
-def get_access_token():
-    return run_cmd(["gcloud", "auth", "print-access-token"])
-
-
-def list_tpus(zones=None):
-    """List all TPU VMs across specified zones."""
-    tpus = []
-    zones = zones or TPU_ZONES
-    for zone in zones:
-        out = run_cmd([
-            "gcloud", "compute", "tpus", "tpu-vm", "list",
-            "--zone", zone, "--format=json"
-        ])
-        if out:
-            try:
-                for tpu in json.loads(out):
-                    tpu["_zone"] = zone
-                    tpus.append(tpu)
-            except json.JSONDecodeError:
-                pass
-    return tpus
-
-
-def query_monitoring(project, access_token, metric_type, minutes=5):
-    """Query Cloud Monitoring API for a TPU metric."""
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(minutes=minutes)
-
-    url = (
-        f"https://monitoring.googleapis.com/v3/projects/{project}"
-        f"/timeSeries"
-        f"?filter=metric.type%3D%22{metric_type}%22"
-        f"&interval.startTime={start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-        f"&interval.endTime={now.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-        f"&aggregation.alignmentPeriod=60s"
-        f"&aggregation.perSeriesAligner=ALIGN_MEAN"
-    )
-
-    out = run_cmd([
-        "curl", "-s", "-H", f"Authorization: Bearer {access_token}", url
-    ], timeout=15)
-    if out:
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def get_tpu_metrics_via_ssh(tpu_name, zone):
-    """SSH into TPU VM and fetch metrics from local Prometheus endpoint."""
-    out = run_cmd([
-        "gcloud", "compute", "tpus", "tpu-vm", "ssh", tpu_name,
-        "--zone", zone, "--worker=all",
-        "--command", "curl -s http://localhost:8431/metrics 2>/dev/null || echo NO_METRICS",
-    ], timeout=30)
-    return out
-
-
-def parse_prometheus_metrics(raw):
-    """Parse Prometheus text format into a dict of metric_name -> value."""
+def parse_prometheus(raw):
+    """Parse Prometheus text format into {metric_name: [(labels_dict, value), ...]}."""
     metrics = {}
     if not raw:
         return metrics
@@ -112,32 +40,71 @@ def parse_prometheus_metrics(raw):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
-        if len(parts) >= 2:
-            name = parts[0].split("{")[0]  # strip labels
-            try:
-                val = float(parts[-1])
-                if name in metrics:
-                    if isinstance(metrics[name], list):
-                        metrics[name].append(val)
-                    else:
-                        metrics[name] = [metrics[name], val]
-                else:
-                    metrics[name] = val
-            except ValueError:
-                pass
+        # Parse: metric_name{label="val",...} value  OR  metric_name value
+        m = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{?(.*?)\}?\s+([\d.eE+\-]+|NaN|Inf|\+Inf|-Inf)$', line)
+        if not m:
+            # Try without labels
+            m = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([\d.eE+\-]+|NaN|Inf|\+Inf|-Inf)$', line)
+            if m:
+                name, val_str = m.group(1), m.group(2)
+                labels = {}
+            else:
+                continue
+        else:
+            name, labels_str, val_str = m.group(1), m.group(2), m.group(3)
+            labels = {}
+            if labels_str:
+                for pair in re.findall(r'(\w+)="([^"]*)"', labels_str):
+                    labels[pair[0]] = pair[1]
+
+        try:
+            val = float(val_str)
+        except ValueError:
+            continue
+
+        metrics.setdefault(name, []).append((labels, val))
     return metrics
 
 
+def get_values(metrics, name):
+    """Get all values for a metric name, returning list of (labels, value)."""
+    return metrics.get(name, [])
+
+
+def avg_values(metrics, name):
+    """Get mean of all values for a metric."""
+    vals = get_values(metrics, name)
+    if not vals:
+        return None
+    return sum(v for _, v in vals) / len(vals)
+
+
+def sum_values(metrics, name):
+    """Get sum of all values for a metric."""
+    vals = get_values(metrics, name)
+    if not vals:
+        return None
+    return sum(v for _, v in vals)
+
+
+def per_chip_values(metrics, name):
+    """Get per-chip values, keyed by chip_id or index."""
+    vals = get_values(metrics, name)
+    result = {}
+    for i, (labels, val) in enumerate(vals):
+        chip_id = labels.get("chip_id", labels.get("core", labels.get("device", str(i))))
+        result[chip_id] = val
+    return result
+
+
 def fmt_bytes(b):
-    """Format bytes to human-readable."""
     if b is None:
         return "N/A"
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
         if abs(b) < 1024:
             return f"{b:.1f} {unit}"
         b /= 1024
-    return f"{b:.1f} PB"
+    return f"{b:.1f} PiB"
 
 
 def fmt_pct(val):
@@ -146,192 +113,220 @@ def fmt_pct(val):
     return f"{val:.1f}%"
 
 
-def aggregate(val):
-    """If val is a list, return the mean; otherwise return val."""
-    if isinstance(val, list):
-        return sum(val) / len(val) if val else None
-    return val
+def bar(pct, width=30):
+    """Render a simple progress bar."""
+    if pct is None:
+        return "[" + "?" * width + "]"
+    filled = int(pct / 100 * width)
+    return "[" + "#" * filled + "." * (width - filled) + "]"
 
 
-def display_tpu_info(tpus):
-    """Display basic TPU info table."""
-    print(f"\n{'='*80}")
-    print(f"  TPU VMs — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*80}")
-    print(f"  {'Name':<25} {'Zone':<20} {'Type':<12} {'Status':<10}")
-    print(f"  {'-'*25} {'-'*20} {'-'*12} {'-'*10}")
-    for tpu in tpus:
-        name = tpu.get("name", "?").split("/")[-1]
-        zone = tpu.get("_zone", "?")
-        accel = tpu.get("acceleratorType", "?")
-        state = tpu.get("state", "?")
-        print(f"  {name:<25} {zone:<20} {accel:<12} {state:<10}")
+def get_host_memory():
+    """Read host memory from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1]) * 1024  # kB -> bytes
+            total = info.get("MemTotal")
+            available = info.get("MemAvailable")
+            if total and available:
+                used = total - available
+                return used, total
+    except (FileNotFoundError, ValueError):
+        pass
+    return None, None
+
+
+def get_num_tpu_chips():
+    """Detect number of TPU chips via /dev/accel* or /dev/vfio/*."""
+    count = 0
+    for path in ["/dev/accel0", "/dev/accel1", "/dev/accel2", "/dev/accel3",
+                 "/dev/accel4", "/dev/accel5", "/dev/accel6", "/dev/accel7"]:
+        if os.path.exists(path):
+            count += 1
+    if count == 0:
+        # Try vfio for TPU v4+
+        vfio = "/dev/vfio"
+        if os.path.isdir(vfio):
+            count = len([f for f in os.listdir(vfio) if f.isdigit()])
+    return count
+
+
+def display(metrics, show_per_chip=True):
+    """Display formatted TPU utilization."""
+    num_chips = get_num_tpu_chips()
+    host_mem_used, host_mem_total = get_host_memory()
+
+    print(f"\n{'='*70}")
+    print(f"  TPU Utilization — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*70}")
+
+    if num_chips:
+        print(f"  TPU chips detected: {num_chips}")
     print()
 
-
-def display_monitoring_metrics(project, token, tpus):
-    """Query and display Cloud Monitoring TPU metrics."""
-    metrics_to_query = [
-        ("tpu.googleapis.com/cpu/utilization", "CPU Utilization"),
-        ("tpu.googleapis.com/memory/usage", "Host Memory Used"),
-        ("tpu.googleapis.com/accelerator/duty_cycle", "TPU Duty Cycle"),
-        ("tpu.googleapis.com/accelerator/memory_usage", "HBM Used (bytes)"),
-        ("tpu.googleapis.com/accelerator/memory_total", "HBM Total (bytes)"),
-    ]
-
-    results = {}
-    for metric_type, label in metrics_to_query:
-        data = query_monitoring(project, token, metric_type)
-        if data and "timeSeries" in data:
-            for series in data["timeSeries"]:
-                resource = series.get("resource", {}).get("labels", {})
-                node_id = resource.get("node_id", "unknown")
-                zone = resource.get("zone", "")
-                key = f"{node_id} ({zone})"
-                if key not in results:
-                    results[key] = {}
-                points = series.get("points", [])
-                if points:
-                    val = points[0].get("value", {})
-                    v = (
-                        val.get("doubleValue")
-                        or val.get("int64Value")
-                        or val.get("distribution", {}).get("mean")
-                    )
-                    if v is not None:
-                        results[key][label] = float(v)
-
-    if results:
-        print("  Cloud Monitoring Metrics (last 5 min avg):")
-        print(f"  {'-'*76}")
-        for node, metrics in sorted(results.items()):
-            print(f"\n  Node: {node}")
-            cpu = metrics.get("CPU Utilization")
-            duty = metrics.get("TPU Duty Cycle")
-            mem_used = metrics.get("HBM Used (bytes)")
-            mem_total = metrics.get("HBM Total (bytes)")
-            host_mem = metrics.get("Host Memory Used")
-
-            if cpu is not None:
-                print(f"    CPU Utilization:    {fmt_pct(cpu * 100)}")
-            if duty is not None:
-                print(f"    TPU Duty Cycle:     {fmt_pct(duty)}")
-            if mem_used is not None and mem_total is not None:
-                pct = (mem_used / mem_total * 100) if mem_total > 0 else 0
-                print(f"    HBM Memory:         {fmt_bytes(mem_used)} / {fmt_bytes(mem_total)} ({fmt_pct(pct)})")
-            elif mem_used is not None:
-                print(f"    HBM Memory Used:    {fmt_bytes(mem_used)}")
-            if host_mem is not None:
-                print(f"    Host Memory Used:   {fmt_bytes(host_mem)}")
+    # --- Host Memory ---
+    print("  Host Memory")
+    print(f"  {'-'*66}")
+    if host_mem_total:
+        pct = host_mem_used / host_mem_total * 100
+        print(f"    RAM:  {fmt_bytes(host_mem_used)} / {fmt_bytes(host_mem_total)}  {bar(pct)} {fmt_pct(pct)}")
     else:
-        print("  No Cloud Monitoring metrics found.")
-        print("  (Metrics may take a few minutes to populate after TPU starts.)")
+        print("    RAM:  N/A (not on Linux or /proc/meminfo unavailable)")
     print()
 
-
-def display_runtime_metrics(tpu_name, zone):
-    """SSH into TPU and display runtime metrics from Prometheus endpoint."""
-    print(f"  Runtime Metrics (via SSH → localhost:8431):")
-    print(f"  {'-'*76}")
-
-    raw = get_tpu_metrics_via_ssh(tpu_name, zone)
-    if not raw or "NO_METRICS" in raw:
-        print("    No runtime metrics available (no workload running or endpoint not active).")
+    if not metrics:
+        print("  TPU Metrics: No data from localhost:8431")
+        print("  (Is a workload running? libtpu exposes metrics only during execution.)")
         print()
         return
 
-    m = parse_prometheus_metrics(raw)
+    # --- HBM Memory ---
+    # Try various known metric names
+    hbm_usage_names = [
+        "tpu_runtime_hbm_memory_usage_bytes",
+        "jax_hbm_memory_usage_bytes",
+        "memory_usage_bytes",
+    ]
+    hbm_total_names = [
+        "tpu_runtime_hbm_memory_total_bytes",
+        "jax_hbm_memory_total_bytes",
+        "memory_total_bytes",
+    ]
 
-    # Common TPU runtime metric names
-    hbm_usage = aggregate(m.get("tpu_runtime_hbm_memory_usage_bytes"))
-    hbm_total = aggregate(m.get("tpu_runtime_hbm_memory_total_bytes"))
-    mem_usage = aggregate(m.get("tpu_runtime_memory_usage_bytes"))
-    mem_limit = aggregate(m.get("tpu_runtime_memory_limit_bytes"))
-    duty = aggregate(m.get("tpu_runtime_duty_cycle_percent"))
-    mxu_util = aggregate(m.get("tpu_runtime_mxu_utilization_percent"))
-    flops = aggregate(m.get("tpu_runtime_teraflops_per_second"))
+    hbm_used_per_chip = {}
+    hbm_total_per_chip = {}
+    for name in hbm_usage_names:
+        hbm_used_per_chip = per_chip_values(metrics, name)
+        if hbm_used_per_chip:
+            break
+    for name in hbm_total_names:
+        hbm_total_per_chip = per_chip_values(metrics, name)
+        if hbm_total_per_chip:
+            break
 
-    has_any = False
-    if hbm_usage is not None:
-        has_any = True
-        if hbm_total:
-            pct = hbm_usage / hbm_total * 100
-            print(f"    HBM Memory:         {fmt_bytes(hbm_usage)} / {fmt_bytes(hbm_total)} ({fmt_pct(pct)})")
-        else:
-            print(f"    HBM Memory Used:    {fmt_bytes(hbm_usage)}")
-    if mem_usage is not None:
-        has_any = True
-        if mem_limit:
-            pct = mem_usage / mem_limit * 100
-            print(f"    Host Memory:        {fmt_bytes(mem_usage)} / {fmt_bytes(mem_limit)} ({fmt_pct(pct)})")
-        else:
-            print(f"    Host Memory Used:   {fmt_bytes(mem_usage)}")
-    if duty is not None:
-        has_any = True
-        print(f"    TPU Duty Cycle:     {fmt_pct(duty)}")
-    if mxu_util is not None:
-        has_any = True
-        print(f"    MXU Utilization:    {fmt_pct(mxu_util)}")
-    if flops is not None:
-        has_any = True
-        print(f"    TFLOPS:             {flops:.1f}")
+    print("  TPU HBM Memory")
+    print(f"  {'-'*66}")
+    if hbm_used_per_chip:
+        for chip_id in sorted(hbm_used_per_chip.keys()):
+            used = hbm_used_per_chip[chip_id]
+            total = hbm_total_per_chip.get(chip_id)
+            if total and total > 0:
+                pct = used / total * 100
+                print(f"    Chip {chip_id}:  {fmt_bytes(used)} / {fmt_bytes(total)}  {bar(pct)} {fmt_pct(pct)}")
+            else:
+                print(f"    Chip {chip_id}:  {fmt_bytes(used)}")
+    else:
+        print("    No HBM memory metrics found.")
+    print()
 
-    if not has_any:
-        # Dump any metrics that look relevant
-        interesting = {k: v for k, v in m.items()
-                       if any(kw in k.lower() for kw in ["memory", "duty", "util", "flop", "hbm", "mxu", "tpu"])}
-        if interesting:
-            print("    Available TPU-related metrics:")
-            for k, v in sorted(interesting.items()):
-                v_agg = aggregate(v)
-                print(f"      {k}: {v_agg}")
-        else:
-            print("    No recognized TPU metrics found in endpoint output.")
-            print(f"    (Got {len(m)} total metrics)")
+    # --- Compute Utilization ---
+    duty_names = [
+        "tpu_runtime_duty_cycle_percent",
+        "jax_duty_cycle_percent",
+        "duty_cycle",
+    ]
+    mxu_names = [
+        "tpu_runtime_mxu_utilization_percent",
+        "jax_mxu_utilization_percent",
+    ]
+    flops_names = [
+        "tpu_runtime_teraflops_per_second",
+        "jax_teraflops",
+    ]
+
+    duty_per_chip = {}
+    mxu_per_chip = {}
+    flops_per_chip = {}
+    for name in duty_names:
+        duty_per_chip = per_chip_values(metrics, name)
+        if duty_per_chip:
+            break
+    for name in mxu_names:
+        mxu_per_chip = per_chip_values(metrics, name)
+        if mxu_per_chip:
+            break
+    for name in flops_names:
+        flops_per_chip = per_chip_values(metrics, name)
+        if flops_per_chip:
+            break
+
+    print("  TPU Compute")
+    print(f"  {'-'*66}")
+    has_compute = False
+    if duty_per_chip:
+        has_compute = True
+        for chip_id in sorted(duty_per_chip.keys()):
+            val = duty_per_chip[chip_id]
+            print(f"    Chip {chip_id} Duty Cycle:     {bar(val)} {fmt_pct(val)}")
+    if mxu_per_chip:
+        has_compute = True
+        for chip_id in sorted(mxu_per_chip.keys()):
+            val = mxu_per_chip[chip_id]
+            print(f"    Chip {chip_id} MXU Util:        {bar(val)} {fmt_pct(val)}")
+    if flops_per_chip:
+        has_compute = True
+        for chip_id in sorted(flops_per_chip.keys()):
+            val = flops_per_chip[chip_id]
+            print(f"    Chip {chip_id} TFLOPS:          {val:.1f}")
+    if not has_compute:
+        print("    No compute utilization metrics found.")
+    print()
+
+
+def display_raw(metrics):
+    """Dump all TPU/memory/compute related metrics."""
+    keywords = ["memory", "hbm", "duty", "util", "flop", "mxu", "tpu", "jax",
+                "xla", "megacore", "infeed", "outfeed"]
+    print(f"\n{'='*70}")
+    print(f"  Raw TPU-related metrics")
+    print(f"{'='*70}")
+    found = False
+    for name in sorted(metrics.keys()):
+        if any(kw in name.lower() for kw in keywords):
+            found = True
+            entries = metrics[name]
+            if len(entries) == 1 and not entries[0][0]:
+                print(f"  {name}: {entries[0][1]}")
+            else:
+                print(f"  {name}:")
+                for labels, val in entries:
+                    label_str = ", ".join(f'{k}="{v}"' for k, v in labels.items()) if labels else ""
+                    print(f"    {{{label_str}}} = {val}")
+    if not found:
+        print("  No TPU-related metrics found.")
+        print(f"  Total metrics available: {len(metrics)}")
+        if metrics:
+            print("  All metric names:")
+            for name in sorted(metrics.keys()):
+                print(f"    {name}")
     print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Show TPU memory & compute utilization")
-    parser.add_argument("--zone", "-z", nargs="*", help="Zone(s) to scan (default: common TPU zones)")
-    parser.add_argument("--watch", "-w", type=int, default=0, help="Refresh interval in seconds (0 = once)")
-    parser.add_argument("--ssh", action="store_true", help="Also SSH into TPUs for runtime metrics")
-    parser.add_argument("--project", "-p", help="GCP project (default: current gcloud config)")
+    parser = argparse.ArgumentParser(description="Show local TPU memory & compute utilization")
+    parser.add_argument("--watch", "-w", type=int, default=0,
+                        help="Refresh interval in seconds (0 = one-shot)")
+    parser.add_argument("--raw", "-r", action="store_true",
+                        help="Dump all TPU-related raw metrics")
+    parser.add_argument("--url", default=METRICS_URL,
+                        help=f"Metrics endpoint URL (default: {METRICS_URL})")
     args = parser.parse_args()
 
-    project = args.project or get_project()
-    if not project:
-        print("Error: Could not determine GCP project. Set with --project or gcloud config.", file=sys.stderr)
-        sys.exit(1)
-
-    zones = args.zone if args.zone else None
+    global METRICS_URL
+    METRICS_URL = args.url
 
     while True:
-        token = get_access_token()
-        if not token:
-            print("Error: Could not get access token. Run 'gcloud auth login'.", file=sys.stderr)
-            sys.exit(1)
+        raw = fetch_metrics()
+        metrics = parse_prometheus(raw) if raw else {}
 
-        tpus = list_tpus(zones)
-        if not tpus:
-            print(f"\nNo TPU VMs found" + (f" in zone(s): {', '.join(zones)}" if zones else " across common zones."))
-            print("Scanned zones:", ", ".join(zones or TPU_ZONES))
-            if args.watch:
-                time.sleep(args.watch)
-                continue
-            sys.exit(0)
-
-        display_tpu_info(tpus)
-        display_monitoring_metrics(project, token, tpus)
-
-        if args.ssh:
-            for tpu in tpus:
-                name = tpu.get("name", "").split("/")[-1]
-                zone = tpu.get("_zone", "")
-                state = tpu.get("state", "")
-                if state == "READY":
-                    print(f"  --- {name} runtime metrics ---")
-                    display_runtime_metrics(name, zone)
+        if args.raw:
+            display_raw(metrics)
+        else:
+            display(metrics)
 
         if args.watch:
             print(f"  Refreshing in {args.watch}s... (Ctrl+C to stop)")
@@ -340,8 +335,7 @@ def main():
             except KeyboardInterrupt:
                 print("\nStopped.")
                 break
-            # Clear screen for refresh
-            print("\033[2J\033[H", end="")
+            print("\033[2J\033[H", end="", flush=True)
         else:
             break
 

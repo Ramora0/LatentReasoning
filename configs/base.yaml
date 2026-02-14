@@ -11,7 +11,7 @@ latent:
   p_anneal_ratio: 0.8
 
 training:
-  batch_size_per_gpu: 4
+  batch_size_per_gpu: 1
   gradient_accumulation_steps: 1
   num_epochs: 5
   learning_rate: 2e-5
