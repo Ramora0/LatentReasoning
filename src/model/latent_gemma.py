@@ -70,16 +70,24 @@ class LatentReasoningModel(nn.Module):
         )
 
     def _disable_layer_grad_checkpointing(self):
-        """Disable per-layer gradient checkpointing to allow KV cache."""
+        """Disable gradient checkpointing to allow KV cache.
+
+        HuggingFace silently sets use_cache=False when gradient_checkpointing
+        is enabled during training, so we must disable both the model-level
+        flag and per-layer flags to make KV caching work.
+        """
         self._saved_grad_ckpt = {}
         for i, layer in enumerate(self.base_model.model.layers):
             self._saved_grad_ckpt[i] = getattr(layer, 'gradient_checkpointing', False)
             layer.gradient_checkpointing = False
+        self._saved_model_grad_ckpt = getattr(self.transformer, 'gradient_checkpointing', False)
+        self.transformer.gradient_checkpointing = False
 
     def _restore_layer_grad_checkpointing(self):
-        """Restore per-layer gradient checkpointing flags."""
+        """Restore gradient checkpointing flags."""
         for i, layer in enumerate(self.base_model.model.layers):
             layer.gradient_checkpointing = self._saved_grad_ckpt.get(i, False)
+        self.transformer.gradient_checkpointing = self._saved_model_grad_ckpt
 
     @property
     def embed_tokens(self):
