@@ -253,6 +253,7 @@ class LatentReasoningModel(nn.Module):
                 hidden_states, attention_mask,
                 torch.tensor(p), torch.tensor(K, dtype=torch.long),
                 use_reentrant=False,
+                preserve_rng_state=not hidden_states.device.type == "xla",
             )
             kv_cache = None
         else:
