@@ -21,9 +21,12 @@ class LatentReasoningModel(nn.Module):
         backend = getattr(config.distributed, "backend", "cuda")
         attn_impl = "eager" if backend == "xla" else "sdpa"
 
+        # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
+        model_dtype = torch.float32 if backend == "xla" else torch.bfloat16
+
         self.base_model = AutoModelForCausalLM.from_pretrained(
             config.model.name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             attn_implementation=attn_impl,
         )
 
