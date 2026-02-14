@@ -48,13 +48,13 @@ def _init_xla_distributed():
 
     Called inside each process spawned by xmp.spawn.
     """
-    import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_backend  # noqa: F401 — registers the 'xla' backend
+    import torch_xla.runtime as xr
 
     if not dist.is_initialized():
         dist.init_process_group(backend="xla", init_method="xla://")
 
-    rank = xm.get_ordinal()
+    rank = xr.global_ordinal()
     return rank
 
 
