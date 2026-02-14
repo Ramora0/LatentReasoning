@@ -44,13 +44,15 @@ def _init_cuda_distributed():
 
 
 def _init_xla_distributed():
-    """Initialize XLA/TPU distributed process group."""
+    """Initialize XLA/TPU distributed process group.
+
+    Called inside each process spawned by xmp.spawn.
+    """
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.xla_backend  # noqa: F401 — registers the 'xla' backend
 
-    # XLA dist init: use xla backend
     if not dist.is_initialized():
-        dist.init_process_group(backend="xla")
+        dist.init_process_group(backend="xla", init_method="xla://")
 
     rank = xm.get_ordinal()
     return rank
@@ -64,22 +66,30 @@ def _get_device(backend: str, rank: int):
     return torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
 
 
-def main():
+def _parse_config():
+    """Parse CLI args and build OmegaConf config."""
     parser = argparse.ArgumentParser(description="Train latent reasoning model")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     args, overrides = parser.parse_known_args()
 
-    # Load config with CLI overrides
     config = OmegaConf.load(args.config)
     if overrides:
         cli_conf = OmegaConf.from_dotlist(overrides)
         config = OmegaConf.merge(config, cli_conf)
+    return config
 
+
+def _train_fn(rank_unused, config):
+    """Training function run by each process.
+
+    For XLA this is called via xmp.spawn (rank_unused is the index arg
+    injected by spawn — we ignore it and use xm.get_ordinal() instead).
+    For CUDA it is called directly from main().
+    """
     backend = getattr(config.distributed, "backend", "cuda")
 
     # Detect and init distributed environment
     if backend == "xla":
-        # XLA: always init (xla_spawn or torchrun sets env vars)
         rank = _init_xla_distributed()
         is_distributed = True
     elif "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -174,6 +184,18 @@ def main():
     # Cleanup
     if is_distributed:
         dist.destroy_process_group()
+
+
+def main():
+    config = _parse_config()
+    backend = getattr(config.distributed, "backend", "cuda")
+
+    if backend == "xla":
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        # xmp.spawn launches one process per TPU core; nprocs=None auto-detects
+        xmp.spawn(_train_fn, args=(config,), nprocs=None)
+    else:
+        _train_fn(0, config)
 
 
 if __name__ == "__main__":
