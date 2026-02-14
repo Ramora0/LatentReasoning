@@ -229,12 +229,11 @@ class LatentReasoningTrainer:
             pin_layout_in_collective_ops=True,
         )
 
-        # XLA gradient checkpointing: apply to decoder layers
-        if self.config.distributed.fsdp_activation_checkpointing:
-            from torch_xla.distributed.fsdp import checkpoint_module
-            for module in model.modules():
-                if isinstance(module, Gemma2DecoderLayer):
-                    checkpoint_module(module)
+        # NOTE: XLA per-layer activation checkpointing (checkpoint_module) is
+        # intentionally skipped. It conflicts with KV cache use inside phase2
+        # (SlidingWindowCache breaks on recompute for short sequences). The model
+        # already wraps the entire phase2 with torch_xla checkpoint, which
+        # provides equivalent memory savings without the cache conflict.
 
         return model
 
