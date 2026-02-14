@@ -283,7 +283,7 @@ class LatentReasoningTrainer:
             sampler=sampler,
             shuffle=shuffle,
             collate_fn=self.collator,
-            num_workers=4,
+            num_workers=0 if self.use_xla else 4,
             pin_memory=not self.use_xla,  # pin_memory is CUDA-only
             drop_last=True,
         )
