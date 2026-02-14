@@ -235,14 +235,15 @@ class LatentReasoningModel(nn.Module):
 
         return torch.cat(thoughts, dim=1), kv_cache  # [B, K, d_model]
 
-    def _phase2_for_checkpoint(self, hidden_states, attention_mask):
+    def _phase2_for_checkpoint(self, hidden_states):
         """Wrapper for torch.checkpoint — returns only thoughts, not KV cache.
 
-        Reads p and K from instance attributes (_ckpt_p, _ckpt_K) rather than
-        checkpoint inputs, to avoid XLA gradient shape mismatches on scalars.
+        Reads p, K, and attention_mask from instance attributes rather than
+        checkpoint inputs, to avoid XLA gradient shape mismatches on
+        non-differentiable tensors and scalars.
         """
         thoughts, _ = self._phase2_core(
-            hidden_states, attention_mask, self._ckpt_p, self._ckpt_K,
+            hidden_states, self._ckpt_attention_mask, self._ckpt_p, self._ckpt_K,
         )
         return thoughts
 
@@ -287,12 +288,13 @@ class LatentReasoningModel(nn.Module):
             # XLA gradient shape mismatches on scalar tensors).
             self._ckpt_p = p
             self._ckpt_K = K
+            self._ckpt_attention_mask = attention_mask
             checkpoint_kwargs = {}
             if not self.use_xla:
                 checkpoint_kwargs["use_reentrant"] = False
             thoughts = self._checkpoint_fn(
                 self._phase2_for_checkpoint,
-                hidden_states, attention_mask,
+                hidden_states,
                 **checkpoint_kwargs,
             )
             kv_cache = None
