@@ -173,7 +173,8 @@ class LatentReasoningModel(nn.Module):
                 def _grad_hook(grad):
                     self._latent_grad_norms[step] = grad.norm().item()
                 return _grad_hook
-            blended.register_hook(_make_grad_hook(0))
+            if blended.requires_grad:
+                blended.register_hook(_make_grad_hook(0))
             thoughts.append(blended)
 
             # Extend mask for thought_0
@@ -196,7 +197,8 @@ class LatentReasoningModel(nn.Module):
                     token_emb = self.embed_tokens(token_ids) * self.normalizer
                 blended = token_emb * p + last_hidden * (1 - p)
 
-                blended.register_hook(_make_grad_hook(k))
+                if blended.requires_grad:
+                    blended.register_hook(_make_grad_hook(k))
                 thoughts.append(blended)
 
                 # Extend mask for this thought

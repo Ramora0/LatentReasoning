@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Quick test: run the base Gemma 2 2B IT model on a math problem and stream output."""
 
+import argparse
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
@@ -33,7 +35,19 @@ PROBLEM = (
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--raw", action="store_true",
+        help="Tokenize like training does: raw text with add_special_tokens=True, no chat template",
+    )
+    args = parser.parse_args()
+
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}\n")
 
     # Load tokenizer + model
@@ -50,22 +64,34 @@ def main():
     )
     model.eval()
 
-    # Build chat-formatted prompt
-    messages = [{"role": "user", "content": PROBLEM}]
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    if args.raw:
+        # Match training: raw text, add_special_tokens=True, no chat template
+        mode = "RAW (training-style)"
+        inputs = tokenizer(
+            PROBLEM,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).to(device)
+        prompt_display = PROBLEM
+    else:
+        # Chat template (what the IT model expects)
+        mode = "CHAT (instruction-tuned)"
+        prompt_display = tokenizer.apply_chat_template(
+            [{"role": "user", "content": PROBLEM}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = tokenizer(prompt_display, return_tensors="pt").to(device)
 
+    print("=" * 60)
+    print(f"MODE: {mode}")
     print("=" * 60)
     print("PROMPT:")
     print("=" * 60)
-    print(prompt)
+    print(prompt_display)
     print("=" * 60)
     print("MODEL OUTPUT (streaming):")
     print("=" * 60)
-
-    # Tokenize
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     # Stream generation
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
