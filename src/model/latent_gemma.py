@@ -36,6 +36,14 @@ class LatentReasoningModel(nn.Module):
             attn_implementation=attn_impl,
         )
 
+        # Disable Gemma 2's sliding window attention on XLA. The
+        # SlidingWindowCache slices keys[:, :, -4095:, :] which raises
+        # RuntimeError on XLA when seq_len < 4096 (XLA enforces strict
+        # bounds unlike CUDA which silently clamps). Since our sequences
+        # are always shorter than 4096, global attention is identical.
+        if self.use_xla and getattr(self.base_model.config, "sliding_window", None):
+            self.base_model.config.sliding_window = None
+
         self.d_model = self.base_model.config.hidden_size  # 2304 for Gemma 2 2B
         self.normalizer = math.sqrt(self.d_model)
 
