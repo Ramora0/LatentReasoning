@@ -214,15 +214,12 @@ class LatentReasoningTrainer:
         # Move model to XLA device first
         model = model.to(self.device)
 
-        # Determine which modules to shard individually
-        # XLA FSDP uses auto_wrap_policy similar to CUDA FSDP
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={Gemma2DecoderLayer},
-        )
-
-        shard_output = None  # Can add custom output sharding if needed
+        # XLA FSDP's recursive_wrap passes different kwargs than CUDA FSDP,
+        # so we use a simple callable instead of transformer_auto_wrap_policy.
+        def auto_wrap_policy(module, recurse, **kwargs):
+            if recurse:
+                return True  # always recurse into children
+            return isinstance(module, Gemma2DecoderLayer)
 
         model = XlaFSDP(
             model,

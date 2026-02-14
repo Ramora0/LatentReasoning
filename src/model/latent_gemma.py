@@ -134,15 +134,80 @@ class LatentReasoningModel(nn.Module):
         embeds = self.embed_tokens(question_ids) * self.normalizer
         return embeds
 
-    def _step0_forward(self, hidden_states, attention_mask):
-        """Step 0 transformer pass, returning only last position.
+    def _phase2_core(self, hidden_states, attention_mask, p, K):
+        """Core phase 2: K autoregressive latent steps with KV cache.
 
-        Used inside torch_checkpoint() so the full [B, seq, d_model] output
-        is not stored — only this [B, 1, d_model] slice is kept. All 26 layers'
-        intermediate activations are recomputed during backward.
+        Disables HF gradient checkpointing internally so KV cache works.
+        All K steps use KV cache for O(seq) per step instead of O(seq²).
+
+        Returns:
+            (thoughts, kv_cache): thoughts is [B, K, d_model]
         """
-        hidden_out = self._run_transformer(hidden_states, attention_mask)
-        return hidden_out[:, -1:, :].contiguous()
+        B = hidden_states.shape[0]
+        device = hidden_states.device
+        thoughts = []
+
+        def _make_grad_hook(step):
+            def _grad_hook(grad):
+                self._latent_grad_norms[step] = grad.norm().item()
+            return _grad_hook
+
+        self._disable_layer_grad_checkpointing()
+        try:
+            # Step 0: full pass, build KV cache
+            hidden_out, kv_cache = self._run_transformer(
+                hidden_states, attention_mask, use_cache=True,
+            )
+            last_hidden = hidden_out[:, -1:, :]
+            del hidden_out
+
+            with torch.no_grad():
+                logits = self.lm_head(last_hidden)
+                token_ids = logits.argmax(dim=-1)
+                token_emb = self.embed_tokens(token_ids) * self.normalizer
+            blended = token_emb * p + last_hidden * (1 - p)
+
+            if blended.requires_grad:
+                blended.register_hook(_make_grad_hook(0))
+            thoughts.append(blended)
+
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            # Steps 1..K-1: single-token passes with KV cache
+            for k in range(1, K):
+                hidden_out, kv_cache = self._run_transformer(
+                    blended, attention_mask, past_key_values=kv_cache, use_cache=True,
+                )
+                last_hidden = hidden_out[:, -1:, :]
+
+                with torch.no_grad():
+                    logits = self.lm_head(last_hidden)
+                    token_ids = logits.argmax(dim=-1)
+                    token_emb = self.embed_tokens(token_ids) * self.normalizer
+                blended = token_emb * p + last_hidden * (1 - p)
+
+                if blended.requires_grad:
+                    blended.register_hook(_make_grad_hook(k))
+                thoughts.append(blended)
+
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+                    dim=1,
+                )
+        finally:
+            self._restore_layer_grad_checkpointing()
+
+        return torch.cat(thoughts, dim=1), kv_cache  # [B, K, d_model]
+
+    def _phase2_for_checkpoint(self, hidden_states, attention_mask, p_tensor, K_tensor):
+        """Wrapper for torch.checkpoint — returns only thoughts, not KV cache."""
+        thoughts, _ = self._phase2_core(
+            hidden_states, attention_mask, p_tensor.item(), int(K_tensor.item()),
+        )
+        return thoughts
 
     def phase2_latent_steps(
         self,
@@ -151,17 +216,15 @@ class LatentReasoningModel(nn.Module):
         K: int,
         p: float,
     ) -> tuple[torch.Tensor, torch.Tensor, object]:
-        """Phase 2: K autoregressive latent steps with detached KV cache.
+        """Phase 2: K autoregressive latent steps.
 
-        Training: Step 0 runs a checkpointed full pass (memory-efficient gradients).
-        A separate no-grad pass builds a detached KV cache for the prefix.
-        Steps 1..K-1 each process 1 token with the detached cache — fast AND
-        memory-efficient since each step's activations are tiny.
+        Training: entire phase is wrapped in torch.checkpoint. During forward,
+        KV cache provides speed but no activations are stored. During backward,
+        phase 3's loss gradient reaches the thought vectors and triggers
+        recomputation of this function to produce gradients — giving 100%
+        complete gradient flow with minimal memory.
 
-        Inference: KV cache is used for all steps (no checkpointing needed).
-
-        Gradients flow through the chain of blended vectors. The detached KV
-        cache provides attention context without autograd overhead.
+        Inference: direct execution, KV cache returned for autoregressive decoding.
 
         Args:
             hidden_states: [B, q_len, d_model] from Phase 1
@@ -173,100 +236,35 @@ class LatentReasoningModel(nn.Module):
             (hidden_states, extended_mask, kv_cache):
                 hidden_states: [B, q_len + K, d_model]
                 extended_mask: [B, q_len + K]
-                kv_cache: past_key_values (detached during training)
+                kv_cache: past_key_values (None during training)
         """
         B = hidden_states.shape[0]
         device = hidden_states.device
         self._latent_grad_norms = {}
-        thoughts = []
-        training = torch.is_grad_enabled()
 
-        def _make_grad_hook(step):
-            def _grad_hook(grad):
-                self._latent_grad_norms[step] = grad.norm().item()
-            return _grad_hook
-
-        # --- Step 0 ---
-        if training:
-            # Checkpointed forward: only last_hidden [B,1,d] is stored;
-            # full-sequence activations are recomputed during backward.
-            # HF per-layer checkpointing is active (use_cache forced False).
-            last_hidden = torch_checkpoint(
-                self._step0_forward, hidden_states, attention_mask,
+        if torch.is_grad_enabled():
+            # Checkpoint all of phase 2: no activations stored during forward.
+            # Backward recomputes phase 2 (with KV cache) to get gradients.
+            thoughts = torch_checkpoint(
+                self._phase2_for_checkpoint,
+                hidden_states, attention_mask,
+                torch.tensor(p), torch.tensor(K, dtype=torch.long),
                 use_reentrant=False,
             )
+            kv_cache = None
         else:
-            # Inference: use KV cache from the start
-            self._disable_layer_grad_checkpointing()
-            hidden_out, kv_cache = self._run_transformer(
-                hidden_states, attention_mask, use_cache=True,
+            thoughts, kv_cache = self._phase2_core(
+                hidden_states, attention_mask, p, K,
             )
-            last_hidden = hidden_out[:, -1:, :]
-            del hidden_out
 
-        # Blend step 0
-        with torch.no_grad():
-            logits = self.lm_head(last_hidden)
-            token_ids = logits.argmax(dim=-1)
-            token_emb = self.embed_tokens(token_ids) * self.normalizer
-        blended = token_emb * p + last_hidden * (1 - p)
-
-        if blended.requires_grad:
-            blended.register_hook(_make_grad_hook(0))
-        thoughts.append(blended)
-
-        attention_mask = torch.cat(
-            [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+        # Extend mask and concatenate (deterministic, outside checkpoint)
+        extended_mask = torch.cat(
+            [attention_mask, torch.ones(B, K, dtype=attention_mask.dtype, device=device)],
             dim=1,
         )
+        hidden_states = torch.cat([hidden_states, thoughts], dim=1)
 
-        # --- Steps 1..K-1: single-token passes with KV cache ---
-        kv_cache = None if training else kv_cache
-        if K > 1:
-            if training:
-                # Build detached KV cache: one extra forward pass under no_grad.
-                # Numerically identical to step 0's cache but carries no autograd
-                # graph, so it won't hold activation memory during backward.
-                # Overhead: 1/(K+1) of total phase2 compute — negligible for large K.
-                self._disable_layer_grad_checkpointing()
-                with torch.no_grad():
-                    _, kv_cache = self._run_transformer(
-                        hidden_states, attention_mask[:, :-1], use_cache=True,
-                    )
-
-            try:
-                for k in range(1, K):
-                    # 1-token forward with cached prefix — O(seq) not O(seq²)
-                    hidden_out, kv_cache = self._run_transformer(
-                        blended, attention_mask, past_key_values=kv_cache, use_cache=True,
-                    )
-                    last_hidden = hidden_out[:, -1:, :]
-
-                    with torch.no_grad():
-                        logits = self.lm_head(last_hidden)
-                        token_ids = logits.argmax(dim=-1)
-                        token_emb = self.embed_tokens(token_ids) * self.normalizer
-                    blended = token_emb * p + last_hidden * (1 - p)
-
-                    if blended.requires_grad:
-                        blended.register_hook(_make_grad_hook(k))
-                    thoughts.append(blended)
-
-                    attention_mask = torch.cat(
-                        [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
-                        dim=1,
-                    )
-            finally:
-                self._restore_layer_grad_checkpointing()
-        elif not training:
-            # K == 1 during inference: still need to restore checkpointing
-            self._restore_layer_grad_checkpointing()
-
-        # Concatenate all thought vectors and append to original hidden_states
-        all_thoughts = torch.cat(thoughts, dim=1)  # [B, K, d_model]
-        hidden_states = torch.cat([hidden_states, all_thoughts], dim=1)
-
-        return hidden_states, attention_mask, kv_cache
+        return hidden_states, extended_mask, kv_cache
 
     def phase3_decode(
         self,
