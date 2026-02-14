@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 
 class LatentReasoningModel(nn.Module):
     """Three-phase latent reasoning model built on Gemma 2 2B.
@@ -36,14 +37,13 @@ class LatentReasoningModel(nn.Module):
             attn_implementation=attn_impl,
         )
 
-        # Widen Gemma 2's sliding window on XLA. The SlidingWindowCache
-        # slices keys[:, :, -(sw-1):, :] which raises RuntimeError on XLA
-        # when seq_len < sw (XLA enforces strict bounds unlike CUDA which
-        # silently clamps). Setting it to max_position_embeddings makes the
-        # sliding window effectively global — identical results since our
-        # sequences are always shorter than the original 4096 window anyway.
-        if self.use_xla and getattr(self.base_model.config, "sliding_window", None):
-            self.base_model.config.sliding_window = self.base_model.config.max_position_embeddings
+        # On XLA, Gemma 2's HybridCache uses SlidingWindowCache which
+        # slices keys[:, :, -(sw-1):, :]. XLA enforces strict bounds on
+        # negative indices (unlike CUDA which silently clamps), so this
+        # crashes when seq_len < sliding_window. We bypass HybridCache
+        # entirely by passing a plain DynamicCache in _run_transformer.
+        # This is safe because our sequences are always << 4096 so
+        # sliding window vs global attention gives identical results.
 
         self.d_model = self.base_model.config.hidden_size  # 2304 for Gemma 2 2B
         self.normalizer = math.sqrt(self.d_model)
@@ -134,6 +134,11 @@ class LatentReasoningModel(nn.Module):
         When use_cache=True, returns (hidden_states, past_key_values).
         Otherwise returns just hidden_states.
         """
+        # On XLA, supply a plain DynamicCache to prevent HF from creating
+        # a HybridCache (whose SlidingWindowCache crashes on XLA when
+        # seq_len < sliding_window due to strict negative-index bounds).
+        if use_cache and past_key_values is None and self.use_xla:
+            past_key_values = DynamicCache()
         outputs = self.transformer(
             inputs_embeds=inputs_embeds / self.normalizer,
             attention_mask=attention_mask,
