@@ -4,7 +4,6 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
@@ -12,8 +11,13 @@ class LatentReasoningModel(nn.Module):
     """Three-phase latent reasoning model built on Gemma 2 2B.
 
     Phase 1 (Encode): Embed question tokens.
-    Phase 2 (Latent): K autoregressive latent steps (each appends one position).
+    Phase 2 (Latent): K autoregressive latent steps (generated no-grad for training).
     Phase 3 (Decode): Teacher-forced answer decoding with direct lm_head projection.
+
+    During training, gradient stitching is used: thoughts are generated without
+    gradients, then a single full-sequence forward pass provides the computation
+    graph. The trainer performs D stitching iterations to propagate gradients
+    across thought boundaries.
     """
 
     def __init__(self, config):
@@ -22,11 +26,6 @@ class LatentReasoningModel(nn.Module):
         # XLA/TPU works best with eager attention; CUDA benefits from SDPA
         backend = getattr(config.distributed, "backend", "cuda")
         self.use_xla = backend == "xla"
-        # Always use standard PyTorch checkpoint. The XLA-specific checkpoint
-        # (torch_xla.utils.checkpoint) mishandles gradient shapes during
-        # backward recomputation when the checkpointed function contains
-        # KV cache + torch.no_grad() blocks (AddBackward0 shape mismatch).
-        self._checkpoint_fn = _torch_checkpoint
         attn_impl = "eager" if self.use_xla else "sdpa"
 
         # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
@@ -75,43 +74,10 @@ class LatentReasoningModel(nn.Module):
             (_init_emb * self.normalizer).reshape(1, 1, self.d_model)
         )
 
-        # Per-step gradient norms populated by backward hooks in phase2
-        self._latent_grad_norms = {}
-
-        # Enable gradient checkpointing on the base model.
-        # On XLA, HF's internal checkpointing uses torch.utils.checkpoint which
-        # crashes (getattr(torch, "xla") doesn't exist). We already wrap the
-        # entire phase2 with torch_xla's checkpoint, so skip HF's per-layer
-        # checkpointing on XLA entirely.
-        if not self.use_xla and hasattr(self.base_model, "gradient_checkpointing_enable"):
-            self.base_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-
         # Check for final logit softcapping (Gemma 2 feature)
         self.final_logit_softcapping = getattr(
             self.base_model.config, "final_logit_softcapping", None
         )
-
-    def _disable_layer_grad_checkpointing(self):
-        """Disable gradient checkpointing to allow KV cache.
-
-        HuggingFace silently sets use_cache=False when gradient_checkpointing
-        is enabled during training, so we must disable both the model-level
-        flag and per-layer flags to make KV caching work.
-        """
-        self._saved_grad_ckpt = {}
-        for i, layer in enumerate(self.base_model.model.layers):
-            self._saved_grad_ckpt[i] = getattr(layer, 'gradient_checkpointing', False)
-            layer.gradient_checkpointing = False
-        self._saved_model_grad_ckpt = getattr(self.transformer, 'gradient_checkpointing', False)
-        self.transformer.gradient_checkpointing = False
-
-    def _restore_layer_grad_checkpointing(self):
-        """Restore gradient checkpointing flags."""
-        for i, layer in enumerate(self.base_model.model.layers):
-            layer.gradient_checkpointing = self._saved_grad_ckpt.get(i, False)
-        self.transformer.gradient_checkpointing = self._saved_model_grad_ckpt
 
     @property
     def embed_tokens(self):
@@ -162,11 +128,78 @@ class LatentReasoningModel(nn.Module):
         embeds = self.embed_tokens(question_ids) * self.normalizer
         return embeds
 
+    @torch.no_grad()
+    def _generate_thoughts_no_grad(self, hidden_states, attention_mask, K, p):
+        """Generate K thought vectors without gradients using KV cache.
+
+        Used during training to cheaply produce thought vectors before the
+        full-sequence forward pass with gradient stitching.
+
+        Returns:
+            list of K tensors, each [B, 1, d_model]
+        """
+        B = hidden_states.shape[0]
+        device = hidden_states.device
+        thoughts = []
+
+        # Step 0: full pass, build KV cache
+        t0 = time.perf_counter()
+        print(f"  [phase2-nograd] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
+        hidden_out, kv_cache = self._run_transformer(
+            hidden_states, attention_mask, use_cache=True,
+        )
+        last_hidden = hidden_out[:, -1:, :]
+        del hidden_out
+
+        logits = self.lm_head(last_hidden)
+        token_ids = logits.argmax(dim=-1)
+        token_emb = self.embed_tokens(token_ids) * self.normalizer
+        blended = token_emb * p + last_hidden * (1 - p)
+        thoughts.append(blended)
+        print(f"  [phase2-nograd] step 0/{K}: done ({time.perf_counter()-t0:.2f}s)", flush=True)
+
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+            dim=1,
+        )
+
+        # Steps 1..K-1: single-token passes with KV cache
+        for k in range(1, K):
+            tk = time.perf_counter()
+            hidden_out, kv_cache = self._run_transformer(
+                blended, attention_mask, past_key_values=kv_cache, use_cache=True,
+            )
+            last_hidden = hidden_out[:, -1:, :]
+
+            logits = self.lm_head(last_hidden)
+            token_ids = logits.argmax(dim=-1)
+            token_emb = self.embed_tokens(token_ids) * self.normalizer
+            blended = token_emb * p + last_hidden * (1 - p)
+            thoughts.append(blended)
+            print(f"  [phase2-nograd] step {k}/{K}: done ({time.perf_counter()-tk:.2f}s)", flush=True)
+
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+                dim=1,
+            )
+
+        return thoughts
+
+    def _prepare_stitching_inputs(self, thoughts):
+        """Clone and detach thought vectors, enabling gradient tracking.
+
+        Each thought is detached from the no-grad generation graph and given
+        requires_grad=True so the trainer can extract gradients for stitching.
+
+        Returns:
+            list of K tensors, each [B, 1, d_model] with requires_grad=True
+        """
+        return [t.detach().clone().requires_grad_(True) for t in thoughts]
+
     def _phase2_core(self, hidden_states, attention_mask, p, K):
-        """Core phase 2: K autoregressive latent steps with KV cache.
+        """Core phase 2 for inference: K autoregressive latent steps with KV cache.
 
         Disables HF gradient checkpointing internally so KV cache works.
-        All K steps use KV cache for O(seq) per step instead of O(seq²).
 
         Returns:
             (thoughts, kv_cache): thoughts is [B, K, d_model]
@@ -175,77 +208,50 @@ class LatentReasoningModel(nn.Module):
         device = hidden_states.device
         thoughts = []
 
-        def _make_grad_hook(step):
-            def _grad_hook(grad):
-                self._latent_grad_norms[step] = grad.norm().item()
-            return _grad_hook
+        # Step 0: full pass, build KV cache
+        t0 = time.perf_counter()
+        print(f"  [phase2] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
+        hidden_out, kv_cache = self._run_transformer(
+            hidden_states, attention_mask, use_cache=True,
+        )
+        last_hidden = hidden_out[:, -1:, :]
+        del hidden_out
 
-        self._disable_layer_grad_checkpointing()
-        try:
-            # Step 0: full pass, build KV cache
-            t0 = time.perf_counter()
-            print(f"  [phase2] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
+        with torch.no_grad():
+            logits = self.lm_head(last_hidden)
+            token_ids = logits.argmax(dim=-1)
+            token_emb = self.embed_tokens(token_ids) * self.normalizer
+        blended = token_emb * p + last_hidden * (1 - p)
+        thoughts.append(blended)
+        print(f"  [phase2] step 0/{K}: thought appended ({time.perf_counter()-t0:.2f}s)", flush=True)
+
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
+            dim=1,
+        )
+
+        # Steps 1..K-1: single-token passes with KV cache
+        for k in range(1, K):
+            tk = time.perf_counter()
             hidden_out, kv_cache = self._run_transformer(
-                hidden_states, attention_mask, use_cache=True,
+                blended, attention_mask, past_key_values=kv_cache, use_cache=True,
             )
             last_hidden = hidden_out[:, -1:, :]
-            del hidden_out
 
             with torch.no_grad():
                 logits = self.lm_head(last_hidden)
                 token_ids = logits.argmax(dim=-1)
                 token_emb = self.embed_tokens(token_ids) * self.normalizer
             blended = token_emb * p + last_hidden * (1 - p)
-
-            if blended.requires_grad:
-                blended.register_hook(_make_grad_hook(0))
             thoughts.append(blended)
-            print(f"  [phase2] step 0/{K}: thought appended ({time.perf_counter()-t0:.2f}s)", flush=True)
+            print(f"  [phase2] step {k}/{K}: thought appended ({time.perf_counter()-tk:.2f}s)", flush=True)
 
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
                 dim=1,
             )
 
-            # Steps 1..K-1: single-token passes with KV cache
-            for k in range(1, K):
-                tk = time.perf_counter()
-                hidden_out, kv_cache = self._run_transformer(
-                    blended, attention_mask, past_key_values=kv_cache, use_cache=True,
-                )
-                last_hidden = hidden_out[:, -1:, :]
-
-                with torch.no_grad():
-                    logits = self.lm_head(last_hidden)
-                    token_ids = logits.argmax(dim=-1)
-                    token_emb = self.embed_tokens(token_ids) * self.normalizer
-                blended = token_emb * p + last_hidden * (1 - p)
-
-                if blended.requires_grad:
-                    blended.register_hook(_make_grad_hook(k))
-                thoughts.append(blended)
-                print(f"  [phase2] step {k}/{K}: thought appended ({time.perf_counter()-tk:.2f}s)", flush=True)
-
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
-                    dim=1,
-                )
-        finally:
-            self._restore_layer_grad_checkpointing()
-
         return torch.cat(thoughts, dim=1), kv_cache  # [B, K, d_model]
-
-    def _phase2_for_checkpoint(self, hidden_states):
-        """Wrapper for torch.checkpoint — returns only thoughts, not KV cache.
-
-        Reads p, K, and attention_mask from instance attributes rather than
-        checkpoint inputs, to avoid XLA gradient shape mismatches on
-        non-differentiable tensors and scalars.
-        """
-        thoughts, _ = self._phase2_core(
-            hidden_states, self._ckpt_attention_mask, self._ckpt_p, self._ckpt_K,
-        )
-        return thoughts
 
     def phase2_latent_steps(
         self,
@@ -256,11 +262,10 @@ class LatentReasoningModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, object]:
         """Phase 2: K autoregressive latent steps.
 
-        Training: entire phase is wrapped in torch.checkpoint. During forward,
-        KV cache provides speed but no activations are stored. During backward,
-        phase 3's loss gradient reaches the thought vectors and triggers
-        recomputation of this function to produce gradients — giving 100%
-        complete gradient flow with minimal memory.
+        Training: thoughts are generated without gradients (fast, KV cache),
+        then detached copies with requires_grad=True are concatenated into the
+        sequence. Gradient stitching in the trainer propagates gradients across
+        thought boundaries via the full-sequence Phase 3 forward pass.
 
         Inference: direct execution, KV cache returned for autoregressive decoding.
 
@@ -278,30 +283,25 @@ class LatentReasoningModel(nn.Module):
         """
         B = hidden_states.shape[0]
         device = hidden_states.device
-        self._latent_grad_norms = {}
 
-        if torch.is_grad_enabled():
-            # Checkpoint all of phase 2: no activations stored during forward.
-            # Backward recomputes phase 2 (with KV cache) to get gradients.
-            # Store p and K as instance attrs so _phase2_for_checkpoint can
-            # read them without them being checkpoint tensor inputs (avoids
-            # XLA gradient shape mismatches on scalar tensors).
-            self._ckpt_p = p
-            self._ckpt_K = K
-            self._ckpt_attention_mask = attention_mask
-            checkpoint_kwargs = {"use_reentrant": False}
-            thoughts = self._checkpoint_fn(
-                self._phase2_for_checkpoint,
-                hidden_states,
-                **checkpoint_kwargs,
-            )
+        if self.training:
+            # Generate thoughts without gradients (fast, KV cache)
+            raw_thoughts = self._generate_thoughts_no_grad(hidden_states, attention_mask, K, p)
+
+            # Prepare stitching inputs (detached, requires_grad=True)
+            thought_inputs = self._prepare_stitching_inputs(raw_thoughts)
+            self._thought_inputs = thought_inputs
+
+            # Stack thoughts for concatenation
+            thoughts = torch.cat(thought_inputs, dim=1)  # [B, K, d_model]
             kv_cache = None
         else:
+            # Inference: direct execution with KV cache
             thoughts, kv_cache = self._phase2_core(
                 hidden_states, attention_mask, p, K,
             )
 
-        # Extend mask and concatenate (deterministic, outside checkpoint)
+        # Extend mask and concatenate
         extended_mask = torch.cat(
             [attention_mask, torch.ones(B, K, dtype=attention_mask.dtype, device=device)],
             dim=1,
@@ -352,19 +352,15 @@ class LatentReasoningModel(nn.Module):
                 [prefix_mask, answer_mask[:, :-1]], dim=1
             )
 
-            self._disable_layer_grad_checkpointing()
-            try:
-                hidden_out = self._run_transformer(
-                    decode_input, decode_mask, past_key_values=kv_cache, use_cache=False
-                )
-            finally:
-                self._restore_layer_grad_checkpointing()
+            hidden_out = self._run_transformer(
+                decode_input, decode_mask, past_key_values=kv_cache, use_cache=False
+            )
 
             # Output covers only the new tokens: [<answer>, ans_0, ans_1, ...]
             # Skip <answer> position, take answer positions
             answer_hidden = hidden_out[:, 1:, :]  # [B, a_len-1, d_model]
         else:
-            # Fallback: no cache, process full sequence
+            # No cache: process full sequence (used during training for gradient stitching)
             decode_input = torch.cat([latent_states, answer_embeds], dim=1)
             decode_mask = torch.cat(
                 [prefix_mask, answer_mask[:, :-1]], dim=1
@@ -372,6 +368,17 @@ class LatentReasoningModel(nn.Module):
             hidden_out = self._run_transformer(decode_input, decode_mask)
             prefix_len = latent_states.shape[1]
             answer_hidden = hidden_out[:, prefix_len:, :]  # [B, a_len-1, d_model]
+
+            # Extract thought outputs for gradient stitching (training only).
+            # thought_outputs[k] is the hidden state at the position that "produced"
+            # thought k: <thinking> output produces t_0, t_0 output produces t_1, etc.
+            if self.training and hasattr(self, '_thought_output_start'):
+                start = self._thought_output_start
+                K = self._K_for_stitching
+                self._thought_outputs = [
+                    hidden_out[:, start + k : start + k + 1, :]
+                    for k in range(K)
+                ]
 
         # Project directly to vocabulary
         logits = self.lm_head(answer_hidden)  # [B, a_len-1, vocab]
@@ -408,12 +415,17 @@ class LatentReasoningModel(nn.Module):
         """Full forward pass: encode -> latent steps -> <answer> -> decode.
 
         Returns:
-            dict with 'loss' and 'logits'
+            dict with 'loss', 'logits', and during training:
+            'thought_inputs' (list of K leaf tensors with requires_grad=True)
+            'thought_outputs' (list of K tensors live in the computation graph)
         """
         # Phase 1: Encode
         t_start = time.perf_counter()
         print(f"[forward] Phase 1: Encoding (q_len={question_ids.shape[1]}, batch={question_ids.shape[0]})...", flush=True)
         hidden_states = self.phase1_encode(question_ids)
+
+        # Store original question length for thought output extraction in phase3
+        q_len_orig = hidden_states.shape[1]
 
         # Insert <thinking> token before latent steps
         B = hidden_states.shape[0]
@@ -426,7 +438,15 @@ class LatentReasoningModel(nn.Module):
         )
         print(f"[forward] Phase 1: done ({time.perf_counter()-t_start:.2f}s)", flush=True)
 
-        # Phase 2: Latent steps (KV cache used internally, detached during training)
+        # Store position info for thought output extraction in phase3.
+        # In the full sequence [q_tokens, <thinking>, t_0..t_{K-1}, <answer>, ans...]:
+        # - <thinking> is at position q_len_orig
+        # - thought_outputs[0] = hidden_out at <thinking> position (produces t_0)
+        # - thought_outputs[k] = hidden_out at t_{k-1} position (produces t_k)
+        self._thought_output_start = q_len_orig
+        self._K_for_stitching = K
+
+        # Phase 2: Latent steps
         t_phase2 = time.perf_counter()
         print(f"[forward] Phase 2: Latent steps (K={K}, p={p:.3f})...", flush=True)
         hidden_states, extended_mask, _ = self.phase2_latent_steps(
@@ -443,8 +463,6 @@ class LatentReasoningModel(nn.Module):
         )
 
         # Phase 3: Decode — full sequence with gradient checkpointing (no KV cache).
-        # Phase3 needs gradients through all positions for the answer loss, and
-        # gradient checkpointing keeps memory bounded.
         t_phase3 = time.perf_counter()
         print(f"[forward] Phase 3: Decoding (a_len={answer_ids.shape[1]})...", flush=True)
         loss, logits = self.phase3_decode(
@@ -453,7 +471,14 @@ class LatentReasoningModel(nn.Module):
         print(f"[forward] Phase 3: done ({time.perf_counter()-t_phase3:.2f}s)", flush=True)
         print(f"[forward] Total forward: {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
 
-        return {"loss": loss, "logits": logits}
+        result = {"loss": loss, "logits": logits}
+
+        # Include stitching tensors during training
+        if self.training:
+            result["thought_inputs"] = getattr(self, '_thought_inputs', None)
+            result["thought_outputs"] = getattr(self, '_thought_outputs', None)
+
+        return result
 
     @torch.no_grad()
     def generate_answer(

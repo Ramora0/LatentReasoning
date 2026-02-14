@@ -101,7 +101,12 @@ class TestLatentReasoningModel:
         B, q_len = dummy_batch["question_ids"].shape
         assert latent.shape == (B, q_len + K, model.d_model)
         assert mask.shape == (B, q_len + K)
-        assert kv_cache is not None
+        # Training mode: kv_cache is None (stitching uses full-sequence forward)
+        # Eval mode: kv_cache is returned for autoregressive decoding
+        if model.training:
+            assert kv_cache is None
+        else:
+            assert kv_cache is not None
 
     def test_forward_output(self, model, dummy_batch):
         """Full forward should return loss and logits with correct shapes."""
@@ -165,20 +170,48 @@ class TestLatentReasoningModel:
         assert generated.shape[0] == dummy_batch["question_ids"].shape[0]
         assert generated.shape[1] <= 8
 
-    def test_kv_cache_gradient_flow(self, model, dummy_batch):
-        """Verify that gradients flow through the KV cache path."""
+    def test_gradient_stitching_flow(self, model, dummy_batch):
+        """Verify that gradient stitching produces gradients on thought inputs and model params."""
         model.zero_grad()
+        K = 2
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(
                 question_ids=dummy_batch["question_ids"],
                 question_mask=dummy_batch["question_mask"],
                 answer_ids=dummy_batch["answer_ids"],
                 answer_mask=dummy_batch["answer_mask"],
-                K=2,
+                K=K,
                 p=0.5,
             )
-        outputs["loss"].backward()
-        # answer_token_emb should get gradients through the KV cache path
+
+        loss = outputs["loss"]
+        thought_inputs = outputs["thought_inputs"]
+        thought_outputs = outputs["thought_outputs"]
+
+        assert thought_inputs is not None
+        assert thought_outputs is not None
+        assert len(thought_inputs) == K
+        assert len(thought_outputs) == K
+
+        # Initial backward with retain_graph
+        loss.backward(retain_graph=True)
+
+        # Thought inputs should have gradients
+        for k, t in enumerate(thought_inputs):
+            assert t.grad is not None, f"thought_inputs[{k}] has no gradient"
+
+        # Perform one stitching iteration
+        g = [t.grad.detach().clone() for t in thought_inputs]
+        for t in thought_inputs:
+            t.grad = None
+
+        L_stitch = sum(
+            (g[k] * thought_outputs[k]).sum()
+            for k in range(len(g))
+        )
+        L_stitch.backward()
+
+        # answer_token_emb should get gradients through the full-sequence pass
         assert model.answer_token_emb.grad is not None
         assert model.answer_token_emb.grad.abs().sum() > 0
         # Transformer weights should also get gradients

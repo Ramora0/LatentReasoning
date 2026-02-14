@@ -40,9 +40,19 @@ pytest tests/test_model.py -k "TestLatentReasoningModel"  # full model tests (ne
 The model (`src/model/latent_gemma.py:LatentReasoningModel`) wraps the base Gemma 2 model with a three-phase forward pass:
 
 1. **Phase 1 — Encode** (`phase1_encode`): Embeds question tokens via the embedding matrix (scaled by √d_model). Questions are **left-padded** so real tokens get contiguous RoPE positions.
-2. **Phase 2 — Latent Steps** (`phase2_latent_steps`): **Autoregressive appending** — each of K steps runs the transformer, takes the last position's hidden state, blends it with a detached token embedding (argmax → re-embed), and appends the result. Output grows from `[B, q_len, d_model]` to `[B, q_len + K, d_model]`. Gradients flow only through the latent path (the `(1-p)` branch). Uses `torch.utils.checkpoint` per step.
+2. **Phase 2 — Latent Steps** (`phase2_latent_steps`): **Training**: K steps run under `torch.no_grad()` with KV cache (`_generate_thoughts_no_grad`), producing K blended thought vectors. These are detached and given `requires_grad=True` as stitching inputs. **Inference**: same autoregressive loop but returns KV cache for decoding. Output grows from `[B, q_len, d_model]` to `[B, q_len + K, d_model]`.
 3. **`<answer>` token** — A learned embedding (`answer_token_emb`) is appended after the K thought vectors to signal the transition to answer generation.
-4. **Phase 3 — Decode** (`phase3_decode`): The prefix (question + thoughts + `<answer>`) is concatenated with teacher-forced answer embeddings. After the transformer pass, answer-position hidden states are projected directly through the frozen lm_head to produce logits. Loss is standard cross-entropy on answer tokens.
+4. **Phase 3 — Decode** (`phase3_decode`): The prefix (question + thoughts + `<answer>`) is concatenated with teacher-forced answer embeddings. Single full-sequence transformer pass with gradients. Answer-position hidden states are projected through the frozen lm_head to produce logits. Loss is standard cross-entropy on answer tokens. During training, also extracts `thought_outputs` (hidden states at thought positions) for gradient stitching.
+
+### Gradient Stitching (Training)
+
+Instead of backpropagating through K sequential transformer calls, gradient stitching decouples thought generation from gradient computation:
+
+1. **Forward**: Phase 2 generates thoughts without grad. Phase 3 runs the full sequence `[q, <thinking>, t_0..t_{K-1}, <answer>, ans...]` through the transformer with gradients.
+2. **`loss.backward(retain_graph=True)`**: Computes gradients on `thought_inputs` (leaf tensors at thought positions).
+3. **D stitching iterations**: Extract gradient `g[k]` from each thought input, compute `L_stitch = Σ g[k] · thought_outputs[k]`, call `L_stitch.backward()`. This propagates gradients across thought boundaries through the Phase 3 computation graph.
+
+`stitching_depth` (D) defaults to K (exact gradients). D=1 is likely sufficient since Phase 3's attention already creates cross-boundary dependencies. No gradient checkpointing is used — all activations are stored for the backward passes.
 
 ### Trainable vs Frozen
 
@@ -51,6 +61,7 @@ The model (`src/model/latent_gemma.py:LatentReasoningModel`) wraps the base Gemm
 | Embedding matrix | Frozen always |
 | lm_head (unembedding) | Frozen always (tied to embedding) |
 | Transformer weights | Trainable |
+| `thinking_token_emb` | Trainable (learned transition marker) |
 | `answer_token_emb` | Trainable (learned transition marker) |
 
 ### Curriculum (`src/training/curriculum.py`)
@@ -77,7 +88,7 @@ Questions are left-padded in the collator (`src/data/collator.py`). HuggingFace 
 
 ## Config
 
-All configuration is via OmegaConf YAML (`configs/base.yaml`) with CLI dotlist overrides. Key sections: `model`, `latent` (K/p schedules), `training`, `distributed` (backend: "cuda" or "xla", FSDP settings), `data`, `eval`, `logging`, `checkpointing`.
+All configuration is via OmegaConf YAML (`configs/base.yaml`) with CLI dotlist overrides. Key sections: `model`, `latent` (K/p schedules/stitching_depth), `training`, `distributed` (backend: "cuda" or "xla", FSDP settings), `data`, `eval`, `logging`, `checkpointing`.
 
 ## Backend Support
 

@@ -6,6 +6,7 @@ model:
 
 latent:
   K: 8
+  stitching_depth: null  # null = use K (exact gradients); set lower for faster training
   p_start: 0.9
   p_end: 0.0
   p_anneal_ratio: 0.8
