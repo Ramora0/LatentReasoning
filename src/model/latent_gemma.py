@@ -22,11 +22,11 @@ class LatentReasoningModel(nn.Module):
         # XLA/TPU works best with eager attention; CUDA benefits from SDPA
         backend = getattr(config.distributed, "backend", "cuda")
         self.use_xla = backend == "xla"
-        if self.use_xla:
-            from torch_xla.utils.checkpoint import checkpoint as _xla_checkpoint
-            self._checkpoint_fn = _xla_checkpoint
-        else:
-            self._checkpoint_fn = _torch_checkpoint
+        # Always use standard PyTorch checkpoint. The XLA-specific checkpoint
+        # (torch_xla.utils.checkpoint) mishandles gradient shapes during
+        # backward recomputation when the checkpointed function contains
+        # KV cache + torch.no_grad() blocks (AddBackward0 shape mismatch).
+        self._checkpoint_fn = _torch_checkpoint
         attn_impl = "eager" if self.use_xla else "sdpa"
 
         # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
@@ -289,9 +289,7 @@ class LatentReasoningModel(nn.Module):
             self._ckpt_p = p
             self._ckpt_K = K
             self._ckpt_attention_mask = attention_mask
-            checkpoint_kwargs = {}
-            if not self.use_xla:
-                checkpoint_kwargs["use_reentrant"] = False
+            checkpoint_kwargs = {"use_reentrant": False}
             thoughts = self._checkpoint_fn(
                 self._phase2_for_checkpoint,
                 hidden_states,
