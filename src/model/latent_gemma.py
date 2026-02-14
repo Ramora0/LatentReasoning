@@ -19,7 +19,8 @@ class LatentReasoningModel(nn.Module):
 
         # XLA/TPU works best with eager attention; CUDA benefits from SDPA
         backend = getattr(config.distributed, "backend", "cuda")
-        attn_impl = "eager" if backend == "xla" else "sdpa"
+        self.use_xla = backend == "xla"
+        attn_impl = "eager" if self.use_xla else "sdpa"
 
         # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
         model_dtype = torch.float32 if backend == "xla" else torch.bfloat16
