@@ -45,6 +45,7 @@ class LatentReasoningTrainer:
         self.K = config.latent.K
         stitching_depth = getattr(config.latent, "stitching_depth", None)
         self.stitching_depth = stitching_depth if stitching_depth is not None else self.K
+        self._stitch_debug = {}
 
         self.backend = getattr(config.distributed, "backend", "cuda")
         self.use_xla = self.backend == "xla"
@@ -384,17 +385,30 @@ class LatentReasoningTrainer:
                 thought_inputs = outputs.get("thought_inputs")
                 thought_outputs = outputs.get("thought_outputs")
                 D = self.stitching_depth
+                stitch_debug = {}
 
                 if thought_inputs and thought_outputs and D > 0:
                     # Initial backward: compute gradients for answer loss,
                     # retain graph for stitching iterations
                     loss.backward(retain_graph=True)
 
+                    # Log initial per-thought gradient norms (replaces old _latent_grad_norms)
+                    for k, t in enumerate(thought_inputs):
+                        if t.grad is not None:
+                            stitch_debug[f"latent_grads/step_{k}"] = t.grad.norm().item()
+
                     for d in range(D):
                         # Extract gradients at thought input boundaries
-                        g = [t.grad.detach().clone() for t in thought_inputs]
+                        g = [t.grad.detach().clone() if t.grad is not None
+                             else torch.zeros_like(t) for t in thought_inputs]
                         for t in thought_inputs:
                             t.grad = None
+
+                        # Log per-iteration gradient norms for debugging amplification
+                        g_norms = [gk.norm().item() for gk in g]
+                        stitch_debug[f"stitch/iter_{d}_g_norm_total"] = sum(n**2 for n in g_norms)**0.5
+                        for k, n in enumerate(g_norms):
+                            stitch_debug[f"stitch/iter_{d}_g_norm_{k}"] = n
 
                         # Stitch: inject gradients into thought output positions.
                         # g[k] flows into thought_outputs[k]:
@@ -404,12 +418,14 @@ class LatentReasoningTrainer:
                             (g[k] * thought_outputs[k]).sum()
                             for k in range(len(g))
                         )
+                        stitch_debug[f"stitch/iter_{d}_L_stitch"] = L_stitch.item()
 
                         retain = (d < D - 1)
                         L_stitch.backward(retain_graph=retain)
                 else:
                     loss.backward()
 
+                self._stitch_debug = stitch_debug
                 accum_loss += loss.item()
                 micro_step += 1
 
@@ -456,6 +472,9 @@ class LatentReasoningTrainer:
                             "data/question_discard_rate": self.train_dataset.discard_rate,
                         }
                         log_dict["stitching/depth"] = self.stitching_depth
+                        # Per-thought latent gradient norms and stitching debug info
+                        if hasattr(self, '_stitch_debug'):
+                            log_dict.update(self._stitch_debug)
                         if torch.cuda.is_available():
                             log_dict["system/gpu_memory_allocated_gb"] = (
                                 torch.cuda.max_memory_allocated(self.device) / 1e9
