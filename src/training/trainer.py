@@ -456,9 +456,14 @@ class LatentReasoningTrainer:
                 self._last_thought_token_ids = outputs.get("thought_token_ids")
                 # loss.item() forces XLA sync — defer to logging time on XLA
                 if self.use_xla:
-                    t_li = time.perf_counter()
                     accum_loss += loss.detach()  # keep on device
-                    print(f"[accum_loss detach] {time.perf_counter()-t_li:.2f}s", flush=True)
+                    # mark_step() flushes the traced graph to the TPU for execution.
+                    # Without this, the entire grad-accum window builds one giant
+                    # graph that only executes at the first .item() call (clip_grad),
+                    # causing a long stall and huge compilation time.
+                    t_ms = time.perf_counter()
+                    self._xm.mark_step()
+                    print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
                 else:
                     accum_loss += loss.item()
                 micro_step += 1
