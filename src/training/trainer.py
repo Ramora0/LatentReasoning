@@ -429,6 +429,10 @@ class LatentReasoningTrainer:
                         if d == 0:
                             g_norms = [gk.norm().item() for gk in g]
                             stitch_debug["thought_sensitivity"] = sum(n**2 for n in g_norms)**0.5
+                            if answer_mean > 0 and K > 0:
+                                stitch_debug["grad/thought_sensitivity_vs_answer"] = (
+                                    stitch_debug["thought_sensitivity"] / (answer_mean * K)
+                                )
 
                         # Stitch: inject gradients into thought output positions.
                         L_stitch = (1 - p) * sum(
