@@ -197,7 +197,7 @@ def main():
         # xmp.spawn launches one process per TPU core
         num_devices = xr.global_runtime_device_count()
         print(f"Launching on {num_devices} XLA devices...")
-        xmp.spawn(_train_fn, args=(config,), nprocs=num_devices)
+        xmp.spawn(_train_fn, args=(config,))
     else:
         _train_fn(0, config)
 
