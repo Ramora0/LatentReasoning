@@ -189,8 +189,6 @@ class LatentReasoningModel(nn.Module):
         thought_token_ids = []
 
         # Step 0: full pass, build KV cache
-        t0 = time.perf_counter()
-        print(f"  [phase2-nograd] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
         hidden_out, kv_cache = self._run_transformer(
             hidden_states, attention_mask, use_cache=True,
         )
@@ -203,7 +201,6 @@ class LatentReasoningModel(nn.Module):
         token_emb = self.embed_tokens(token_ids) * self.normalizer
         blended = token_emb * p + last_hidden * (1 - p)
         thoughts.append(blended)
-        print(f"  [phase2-nograd] step 0/{K}: done ({time.perf_counter()-t0:.2f}s)", flush=True)
 
         attention_mask = torch.cat(
             [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -212,7 +209,6 @@ class LatentReasoningModel(nn.Module):
 
         # Steps 1..K-1: single-token passes with KV cache
         for k in range(1, K):
-            tk = time.perf_counter()
             hidden_out, kv_cache = self._run_transformer(
                 blended, attention_mask, past_key_values=kv_cache, use_cache=True,
             )
@@ -224,7 +220,6 @@ class LatentReasoningModel(nn.Module):
             token_emb = self.embed_tokens(token_ids) * self.normalizer
             blended = token_emb * p + last_hidden * (1 - p)
             thoughts.append(blended)
-            print(f"  [phase2-nograd] step {k}/{K}: done ({time.perf_counter()-tk:.2f}s)", flush=True)
 
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -258,8 +253,6 @@ class LatentReasoningModel(nn.Module):
         thoughts = []
 
         # Step 0: full pass, build KV cache
-        t0 = time.perf_counter()
-        print(f"  [phase2] step 0/{K}: full transformer pass (seq_len={hidden_states.shape[1]})...", flush=True)
         hidden_out, kv_cache = self._run_transformer(
             hidden_states, attention_mask, use_cache=True,
         )
@@ -272,7 +265,6 @@ class LatentReasoningModel(nn.Module):
             token_emb = self.embed_tokens(token_ids) * self.normalizer
         blended = token_emb * p + last_hidden * (1 - p)
         thoughts.append(blended)
-        print(f"  [phase2] step 0/{K}: thought appended ({time.perf_counter()-t0:.2f}s)", flush=True)
 
         attention_mask = torch.cat(
             [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -281,7 +273,6 @@ class LatentReasoningModel(nn.Module):
 
         # Steps 1..K-1: single-token passes with KV cache
         for k in range(1, K):
-            tk = time.perf_counter()
             hidden_out, kv_cache = self._run_transformer(
                 blended, attention_mask, past_key_values=kv_cache, use_cache=True,
             )
@@ -293,7 +284,6 @@ class LatentReasoningModel(nn.Module):
                 token_emb = self.embed_tokens(token_ids) * self.normalizer
             blended = token_emb * p + last_hidden * (1 - p)
             thoughts.append(blended)
-            print(f"  [phase2] step {k}/{K}: thought appended ({time.perf_counter()-tk:.2f}s)", flush=True)
 
             attention_mask = torch.cat(
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
@@ -481,7 +471,6 @@ class LatentReasoningModel(nn.Module):
         """
         # Phase 1: Encode
         t_start = time.perf_counter()
-        print(f"[forward] Phase 1: Encoding (q_len={question_ids.shape[1]}, batch={question_ids.shape[0]})...", flush=True)
         hidden_states = self.phase1_encode(question_ids)
 
         # Store original question length for thought output extraction in phase3
@@ -496,8 +485,6 @@ class LatentReasoningModel(nn.Module):
             [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
             dim=1,
         )
-        print(f"[forward] Phase 1: done ({time.perf_counter()-t_start:.2f}s)", flush=True)
-
         # Store position info for thought output extraction in phase3.
         # In the full sequence [q_tokens, <thinking>, t_0..t_{K-1}, <answer>, ans...]:
         # - <thinking> is at position q_len_orig
@@ -507,12 +494,9 @@ class LatentReasoningModel(nn.Module):
         self._K_for_stitching = K
 
         # Phase 2: Latent steps
-        t_phase2 = time.perf_counter()
-        print(f"[forward] Phase 2: Latent steps (K={K}, p={p:.3f})...", flush=True)
         hidden_states, extended_mask, _ = self.phase2_latent_steps(
             hidden_states, question_mask, K, p
         )
-        print(f"[forward] Phase 2: done ({time.perf_counter()-t_phase2:.2f}s)", flush=True)
 
         # Insert <answer> token
         answer_marker = self.answer_token_emb.expand(B, -1, -1)  # [B, 1, d_model]
@@ -523,13 +507,10 @@ class LatentReasoningModel(nn.Module):
         )
 
         # Phase 3: Decode — full sequence with gradient checkpointing (no KV cache).
-        t_phase3 = time.perf_counter()
-        print(f"[forward] Phase 3: Decoding (a_len={answer_ids.shape[1]})...", flush=True)
         loss, logits = self.phase3_decode(
             hidden_states, extended_mask, answer_ids, answer_mask,
         )
-        print(f"[forward] Phase 3: done ({time.perf_counter()-t_phase3:.2f}s)", flush=True)
-        print(f"[forward] Total forward: {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
+        print(f"[forward] {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
 
         result = {"loss": loss, "logits": logits}
         result["thought_token_ids"] = getattr(self, '_thought_token_ids', None)

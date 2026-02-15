@@ -391,7 +391,9 @@ class LatentReasoningTrainer:
                 if thought_inputs and thought_outputs and D > 0:
                     # Initial backward: compute gradients for answer loss,
                     # retain graph for stitching iterations
+                    t_back = time.perf_counter()
                     loss.backward(retain_graph=True)
+                    print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
 
                     # Gradient decomposition: thought positions vs answer positions
                     decode_input = outputs.get("decode_input")
@@ -417,6 +419,7 @@ class LatentReasoningTrainer:
                         if denom_total > 0:
                             stitch_debug["grad/thought_pct_total"] = thought_total / denom_total
 
+                    t_stitch = time.perf_counter()
                     for d in range(D):
                         # Extract gradients at thought input boundaries
                         g = [t.grad.detach().clone() if t.grad is not None
@@ -442,8 +445,11 @@ class LatentReasoningTrainer:
 
                         retain = (d < D - 1)
                         L_stitch.backward(retain_graph=retain)
+                    print(f"[stitch] D={D}, {time.perf_counter()-t_stitch:.2f}s", flush=True)
                 else:
+                    t_back = time.perf_counter()
                     loss.backward()
+                    print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
 
                 self._stitch_debug = stitch_debug
                 self._last_thought_token_ids = outputs.get("thought_token_ids")
@@ -459,6 +465,7 @@ class LatentReasoningTrainer:
                     grad_norm = self._clip_grad_norm()
 
                     # Optimizer step (XLA needs mark_step)
+                    t_opt = time.perf_counter()
                     if self.use_xla:
                         self._xla_step()
                     else:
@@ -466,6 +473,7 @@ class LatentReasoningTrainer:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
                     self.optimizer_step += 1
+                    print(f"[optim] {time.perf_counter()-t_opt:.2f}s", flush=True)
 
                     # Accumulate stats for logging window
                     log_loss += accum_loss
