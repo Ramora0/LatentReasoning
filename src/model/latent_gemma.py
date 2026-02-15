@@ -186,6 +186,7 @@ class LatentReasoningModel(nn.Module):
         B = hidden_states.shape[0]
         device = hidden_states.device
         thoughts = []
+        thought_token_ids = []
 
         # Step 0: full pass, build KV cache
         t0 = time.perf_counter()
@@ -198,6 +199,7 @@ class LatentReasoningModel(nn.Module):
 
         logits = self.lm_head(last_hidden)
         token_ids = logits.argmax(dim=-1)
+        thought_token_ids.append(token_ids[:, 0])  # [B]
         token_emb = self.embed_tokens(token_ids) * self.normalizer
         blended = token_emb * p + last_hidden * (1 - p)
         thoughts.append(blended)
@@ -218,6 +220,7 @@ class LatentReasoningModel(nn.Module):
 
             logits = self.lm_head(last_hidden)
             token_ids = logits.argmax(dim=-1)
+            thought_token_ids.append(token_ids[:, 0])  # [B]
             token_emb = self.embed_tokens(token_ids) * self.normalizer
             blended = token_emb * p + last_hidden * (1 - p)
             thoughts.append(blended)
@@ -228,6 +231,7 @@ class LatentReasoningModel(nn.Module):
                 dim=1,
             )
 
+        self._thought_token_ids = torch.stack(thought_token_ids, dim=1)  # [B, K]
         return thoughts
 
     def _prepare_stitching_inputs(self, thoughts):
@@ -525,6 +529,7 @@ class LatentReasoningModel(nn.Module):
         print(f"[forward] Total forward: {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
 
         result = {"loss": loss, "logits": logits}
+        result["thought_token_ids"] = getattr(self, '_thought_token_ids', None)
 
         # Include stitching tensors during training
         if self.training:

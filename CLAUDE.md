@@ -16,6 +16,11 @@ pip install -e .          # core deps
 pip install -e ".[dev]"   # + pytest, pytest-timeout
 pip install -e ".[tpu]"   # + torch_xla
 
+# TPU manual install (torch 2.9.0 CPU + torch_xla 2.9.0)
+pip uninstall -y torch torch_xla && \
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu && \
+pip install 'torch_xla[tpu] @ https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.9.0.dev-cp312-cp312-linux_x86_64.whl' -f https://storage.googleapis.com/libtpu-wheels/index.html
+
 # Train
 python scripts/train.py --config configs/base.yaml                           # single GPU
 torchrun --nproc_per_node=4 scripts/train.py --config configs/base.yaml      # multi-GPU FSDP

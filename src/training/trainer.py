@@ -393,10 +393,6 @@ class LatentReasoningTrainer:
                     # retain graph for stitching iterations
                     loss.backward(retain_graph=True)
 
-                    # Log initial per-thought gradient norms (replaces old _latent_grad_norms)
-                    for k, t in enumerate(thought_inputs):
-                        if t.grad is not None:
-                            stitch_debug[f"latent_grads/step_{k}"] = t.grad.norm().item()
 
                     for d in range(D):
                         # Extract gradients at thought input boundaries
@@ -405,24 +401,17 @@ class LatentReasoningTrainer:
                         for t in thought_inputs:
                             t.grad = None
 
-                        # Log per-iteration gradient norms for debugging amplification
-                        g_norms = [gk.norm().item() for gk in g]
-                        stitch_debug[f"stitch/iter_{d}_g_norm_total"] = sum(n**2 for n in g_norms)**0.5
-                        for k, n in enumerate(g_norms):
-                            stitch_debug[f"stitch/iter_{d}_g_norm_{k}"] = n
+                        # On first iteration, log how much the answer loss depends
+                        # on thought content (L2 norm of dLoss/dThoughts)
+                        if d == 0:
+                            g_norms = [gk.norm().item() for gk in g]
+                            stitch_debug["thought_sensitivity"] = sum(n**2 for n in g_norms)**0.5
 
                         # Stitch: inject gradients into thought output positions.
-                        # g[k] flows into thought_outputs[k]:
-                        #   thought_outputs[0] = <thinking> output (produces t_0)
-                        #   thought_outputs[k] = t_{k-1} output (produces t_k)
-                        # Scale by (1-p) to match the blending boundary:
-                        #   thought[k] = token_emb * p + hidden * (1-p)
-                        #   so ∂thought[k]/∂hidden = (1-p)
                         L_stitch = (1 - p) * sum(
                             (g[k] * thought_outputs[k]).sum()
                             for k in range(len(g))
                         )
-                        stitch_debug[f"stitch/iter_{d}_L_stitch"] = L_stitch.item()
 
                         retain = (d < D - 1)
                         L_stitch.backward(retain_graph=retain)
@@ -430,13 +419,15 @@ class LatentReasoningTrainer:
                     loss.backward()
 
                 self._stitch_debug = stitch_debug
-                self._last_batch = batch
-                self._last_logits = outputs["logits"].detach()
+                self._last_thought_token_ids = outputs.get("thought_token_ids")
                 accum_loss += loss.item()
                 micro_step += 1
 
                 # Optimizer step every grad_accum_steps micro-batches
                 if micro_step % self.grad_accum_steps == 0:
+                    # Measure model grad norm after stitching (answer + stitch combined).
+                    # Compare with grad_decomposition/answer_loss to see how much
+                    # stitching contributed to the total gradient.
                     # Gradient clipping
                     grad_norm = self._clip_grad_norm()
 
@@ -493,20 +484,15 @@ class LatentReasoningTrainer:
                             wandb.log(log_dict, step=self.optimizer_step)
                         pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
 
-                        # Print sample decoded tokens from first example in last batch
-                        if self.tokenizer is not None and hasattr(self, '_last_logits'):
+                        # Print sample thought tokens from first example in last batch
+                        if self.tokenizer is not None and self._last_thought_token_ids is not None:
                             try:
-                                # logits are [B, a_len-1, vocab] predicting answer_ids[:, 1:]
-                                pred_ids = self._last_logits[0].argmax(dim=-1)  # [a_len-1]
-                                target_ids = self._last_batch["answer_ids"][0, 1:]  # [a_len-1]
-                                target_mask = self._last_batch["answer_mask"][0, 1:]  # [a_len-1]
-                                real = target_mask.bool()
-                                target_toks = self.tokenizer.decode(target_ids[real], skip_special_tokens=False)
-                                pred_toks = self.tokenizer.decode(pred_ids[real], skip_special_tokens=False)
-                                print(f"\n  [sample] target: {target_toks[:120]}")
-                                print(f"  [sample] pred:   {pred_toks[:120]}")
-                            except Exception:
-                                pass
+                                thought_toks = self.tokenizer.decode(
+                                    self._last_thought_token_ids[0], skip_special_tokens=False
+                                )
+                                print(f"\n  [sample] thoughts: {thought_toks[:200]}")
+                            except Exception as e:
+                                print(f"\n  [sample] decode error: {e}")
 
                         log_loss = 0.0
                         log_grad_norm = 0.0
