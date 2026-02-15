@@ -51,6 +51,102 @@ class TestCurriculumScheduler:
         assert abs(self.scheduler.get_p(10000) - 0.0) < 1e-6
 
 
+# --- Attention Mask Tests (no GPU needed) ---
+
+class TestQuestionMasking:
+    """Tests for the 4D attention mask that hides question tokens from answer positions."""
+
+    def setup_method(self):
+        """Create a minimal model instance just for mask-building methods."""
+        # We only need the mask helper methods, so we monkey-patch a lightweight object
+        self.model = LatentReasoningModel.__new__(LatentReasoningModel)
+
+    def test_causal_mask_structure(self):
+        """Verify the 4D mask has correct causal + question-masking structure."""
+        B, seq_len, q_len = 2, 10, 3
+        answer_start = 7  # positions 7,8,9 are answer marker + answer tokens
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        # All positions valid (no padding)
+        decode_mask_2d = torch.ones(B, seq_len, dtype=torch.long, device=device)
+        mask = self.model._build_question_masked_causal_mask(
+            decode_mask_2d, q_len, answer_start, dtype, device
+        )
+
+        assert mask.shape == (B, 1, seq_len, seq_len)
+        min_val = torch.finfo(dtype).min
+
+        for b in range(B):
+            m = mask[b, 0]
+            # Question rows (0..q_len-1) CAN attend to question columns (causal)
+            for row in range(q_len):
+                for col in range(row + 1):
+                    assert m[row, col].item() == 0.0, f"Question row {row} should see col {col}"
+
+            # Thought rows (q_len..answer_start-1) CAN attend to question columns
+            for row in range(q_len, answer_start):
+                for col in range(q_len):
+                    assert m[row, col].item() == 0.0, f"Thought row {row} should see question col {col}"
+
+            # Answer rows (answer_start..seq_len-1) CANNOT attend to question columns
+            for row in range(answer_start, seq_len):
+                for col in range(q_len):
+                    assert m[row, col].item() == min_val, f"Answer row {row} should NOT see question col {col}"
+
+            # Answer rows CAN attend to thought columns (q_len..answer_start-1)
+            for row in range(answer_start, seq_len):
+                for col in range(q_len, row + 1):
+                    assert m[row, col].item() == 0.0, f"Answer row {row} should see thought col {col}"
+
+            # Causal: no future attention
+            for row in range(seq_len):
+                for col in range(row + 1, seq_len):
+                    assert m[row, col].item() == min_val, f"Row {row} should NOT see future col {col}"
+
+    def test_causal_mask_with_padding(self):
+        """Verify padding columns are masked out."""
+        B, seq_len, q_len = 1, 8, 3
+        answer_start = 5
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        # First 2 positions are padding (left-padded question)
+        decode_mask_2d = torch.tensor([[0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.long, device=device)
+        mask = self.model._build_question_masked_causal_mask(
+            decode_mask_2d, q_len, answer_start, dtype, device
+        )
+
+        min_val = torch.finfo(dtype).min
+        m = mask[0, 0]
+
+        # Padding columns should be masked for all rows
+        for row in range(seq_len):
+            assert m[row, 0].item() == min_val, f"Row {row} should not see padding col 0"
+            assert m[row, 1].item() == min_val, f"Row {row} should not see padding col 1"
+
+    def test_inference_mask(self):
+        """Verify the inference mask hides question columns."""
+        B, kv_len, q_len = 2, 12, 4
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        mask_2d = torch.ones(B, kv_len, dtype=torch.long, device=device)
+        mask = self.model._build_inference_mask(mask_2d, q_len, dtype, device)
+
+        assert mask.shape == (B, 1, 1, kv_len)
+        min_val = torch.finfo(dtype).min
+
+        for b in range(B):
+            m = mask[b, 0, 0]
+            # Question columns should be hidden
+            for col in range(q_len):
+                assert m[col].item() == min_val, f"Question col {col} should be hidden"
+            # Non-question columns should be visible
+            for col in range(q_len, kv_len):
+                assert m[col].item() == 0.0, f"Col {col} should be visible"
+
+
 # --- Full Model Tests (require GPU and model download) ---
 
 def _requires_gpu():

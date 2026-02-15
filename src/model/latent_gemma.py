@@ -116,6 +116,51 @@ class LatentReasoningModel(nn.Module):
             return outputs.last_hidden_state, outputs.past_key_values
         return outputs.last_hidden_state
 
+    def _build_question_masked_causal_mask(self, decode_mask_2d, q_len, answer_start, dtype, device):
+        """Build 4D causal mask that hides question tokens from answer+marker positions.
+
+        Args:
+            decode_mask_2d: [B, seq_len] padding mask (1=valid, 0=padding)
+            q_len: number of question positions (before <thinking>)
+            answer_start: first row that cannot see questions (<answer> marker position)
+            dtype: float dtype for the mask
+            device: torch device
+        Returns:
+            [B, 1, seq_len, seq_len] additive attention mask
+        """
+        B, seq_len = decode_mask_2d.shape
+        # Lower-triangular causal mask
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        # Expand to [B, 1, seq_len, seq_len]
+        mask = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, seq_len, seq_len).clone()
+        # AND with padding columns: mask out columns where decode_mask_2d == 0
+        padding_cols = decode_mask_2d.bool().unsqueeze(1).unsqueeze(1)  # [B, 1, 1, seq_len]
+        mask = mask & padding_cols
+        # Hide question columns for answer rows (answer_start onwards)
+        mask[:, :, answer_start:, :q_len] = False
+        # Convert to additive: True -> 0.0, False -> finfo.min
+        additive_mask = torch.where(mask, torch.tensor(0.0, dtype=dtype, device=device),
+                                    torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=device))
+        return additive_mask
+
+    def _build_inference_mask(self, mask_2d, q_len, dtype, device):
+        """Build 4D mask for a single-token inference step with KV cache.
+
+        Args:
+            mask_2d: [B, kv_len] padding mask covering cached + new positions
+            q_len: number of question positions to hide
+            dtype: float dtype
+            device: torch device
+        Returns:
+            [B, 1, 1, kv_len] additive attention mask
+        """
+        bool_mask = mask_2d.bool().clone()
+        bool_mask[:, :q_len] = False
+        bool_mask = bool_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, kv_len]
+        additive_mask = torch.where(bool_mask, torch.tensor(0.0, dtype=dtype, device=device),
+                                    torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=device))
+        return additive_mask
+
     def phase1_encode(self, question_ids: torch.Tensor) -> torch.Tensor:
         """Phase 1: Embed question tokens (no transformer pass).
 
@@ -365,7 +410,13 @@ class LatentReasoningModel(nn.Module):
             decode_mask = torch.cat(
                 [prefix_mask, answer_mask[:, :-1]], dim=1
             )
-            hidden_out = self._run_transformer(decode_input, decode_mask)
+            # Build 4D mask hiding question tokens from answer positions
+            q_len = self._thought_output_start  # positions 0..q_len-1 are question tokens
+            answer_start = latent_states.shape[1] - 1  # <answer> marker position
+            decode_mask_4d = self._build_question_masked_causal_mask(
+                decode_mask, q_len, answer_start, decode_input.dtype, decode_input.device
+            )
+            hidden_out = self._run_transformer(decode_input, decode_mask_4d)
             prefix_len = latent_states.shape[1]
             answer_hidden = hidden_out[:, prefix_len:, :]  # [B, a_len-1, d_model]
 
@@ -509,6 +560,7 @@ class LatentReasoningModel(nn.Module):
 
         # Phase 1: Encode
         hidden_states = self.phase1_encode(question_ids)
+        q_len_orig = hidden_states.shape[1]  # question positions to mask from answers
 
         # Insert <thinking> token
         thinking_marker = self.thinking_token_emb.expand(B, -1, -1)
@@ -529,8 +581,12 @@ class LatentReasoningModel(nn.Module):
             [extended_mask, torch.ones(B, 1, dtype=extended_mask.dtype, device=device)],
             dim=1,
         )
+        # Build 4D mask hiding question tokens for the <answer> position
+        answer_mask_4d = self._build_inference_mask(
+            current_mask, q_len_orig, answer_marker.dtype, device
+        )
         hidden_out, kv_cache = self._run_transformer(
-            answer_marker, current_mask, past_key_values=kv_cache, use_cache=True
+            answer_marker, answer_mask_4d, past_key_values=kv_cache, use_cache=True
         )
 
         # Get logits from <answer> position
@@ -554,8 +610,12 @@ class LatentReasoningModel(nn.Module):
                 [current_mask, torch.ones(B, 1, dtype=current_mask.dtype, device=device)],
                 dim=1,
             )
+            # Build 4D mask hiding question tokens for each autoregressive step
+            step_mask_4d = self._build_inference_mask(
+                current_mask, q_len_orig, next_emb.dtype, device
+            )
             hidden_out, kv_cache = self._run_transformer(
-                next_emb, current_mask, past_key_values=kv_cache, use_cache=True
+                next_emb, step_mask_4d, past_key_values=kv_cache, use_cache=True
             )
 
             last_hidden = hidden_out[:, -1:, :]
