@@ -270,7 +270,7 @@ class LatentReasoningTrainer:
             sampler=sampler,
             shuffle=shuffle,
             collate_fn=self.collator,
-            num_workers=0 if self.use_xla else 4,
+            num_workers=4,
             pin_memory=not self.use_xla,  # pin_memory is CUDA-only
             drop_last=True,
         )
@@ -393,6 +393,29 @@ class LatentReasoningTrainer:
                     # retain graph for stitching iterations
                     loss.backward(retain_graph=True)
 
+                    # Gradient decomposition: thought positions vs answer positions
+                    decode_input = outputs.get("decode_input")
+                    if decode_input is not None and decode_input.grad is not None:
+                        grad = decode_input.grad
+                        t_start, t_end = outputs["thought_positions"]
+                        a_start = outputs["answer_positions"][0]
+                        # Per-position L2 norms, averaged over batch
+                        thought_grad = grad[:, t_start:t_end, :]
+                        answer_grad = grad[:, a_start:, :]
+                        # Mean per-position norm (normalized by position count)
+                        thought_mean = thought_grad.norm(dim=-1).mean().item()
+                        answer_mean = answer_grad.norm(dim=-1).mean().item()
+                        # Total L2 norm (unnormalized)
+                        thought_total = thought_grad.norm().item()
+                        answer_total = answer_grad.norm().item()
+                        stitch_debug["grad/thought_mean_norm"] = thought_mean
+                        stitch_debug["grad/answer_mean_norm"] = answer_mean
+                        denom_mean = thought_mean + answer_mean
+                        if denom_mean > 0:
+                            stitch_debug["grad/thought_pct_per_pos"] = thought_mean / denom_mean
+                        denom_total = thought_total + answer_total
+                        if denom_total > 0:
+                            stitch_debug["grad/thought_pct_total"] = thought_total / denom_total
 
                     for d in range(D):
                         # Extract gradients at thought input boundaries

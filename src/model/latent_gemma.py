@@ -411,6 +411,9 @@ class LatentReasoningModel(nn.Module):
         else:
             # No cache: process full sequence (used during training for gradient stitching)
             decode_input = torch.cat([latent_states, answer_embeds], dim=1)
+            if self.training:
+                decode_input.retain_grad()
+                self._decode_input = decode_input
             decode_mask = torch.cat(
                 [prefix_mask, answer_mask[:, :-1]], dim=1
             )
@@ -535,6 +538,9 @@ class LatentReasoningModel(nn.Module):
         if self.training:
             result["thought_inputs"] = getattr(self, '_thought_inputs', None)
             result["thought_outputs"] = getattr(self, '_thought_outputs', None)
+            result["decode_input"] = getattr(self, '_decode_input', None)
+            result["thought_positions"] = (self._thought_output_start, self._thought_output_start + K)
+            result["answer_positions"] = (hidden_states.shape[1], None)  # prefix_len to end
 
         return result
 
