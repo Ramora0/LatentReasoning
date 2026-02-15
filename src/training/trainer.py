@@ -496,10 +496,10 @@ class LatentReasoningTrainer:
                         # Print sample decoded tokens from first example in last batch
                         if self.tokenizer is not None and hasattr(self, '_last_logits'):
                             try:
-                                pred_ids = self._last_logits[0].argmax(dim=-1)
-                                target_ids = self._last_batch["answer_ids"][0]
-                                target_mask = self._last_batch["answer_mask"][0]
-                                # Only show tokens where mask is 1 (real answer tokens)
+                                # logits are [B, a_len-1, vocab] predicting answer_ids[:, 1:]
+                                pred_ids = self._last_logits[0].argmax(dim=-1)  # [a_len-1]
+                                target_ids = self._last_batch["answer_ids"][0, 1:]  # [a_len-1]
+                                target_mask = self._last_batch["answer_mask"][0, 1:]  # [a_len-1]
                                 real = target_mask.bool()
                                 target_toks = self.tokenizer.decode(target_ids[real], skip_special_tokens=False)
                                 pred_toks = self.tokenizer.decode(pred_ids[real], skip_special_tokens=False)
