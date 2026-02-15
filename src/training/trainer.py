@@ -280,11 +280,14 @@ class LatentReasoningTrainer:
     # ---- Gradient clipping (backend-aware) ----
 
     def _clip_grad_norm(self) -> float:
-        """Clip gradient norms, returning the total norm."""
+        """Clip gradient norms, returning the total norm.
+
+        On XLA we still call .item() here because clip_grad_norm_ needs
+        the value for the clipping decision. This is one unavoidable sync.
+        """
         max_norm = self.config.training.max_grad_norm
 
         if self.use_xla:
-            # XLA: use xm.optimizer_step handles sync; clip manually
             from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as XlaFSDP
             if isinstance(self.model, XlaFSDP):
                 grad_norm = self.model.clip_grad_norm_(max_norm)
@@ -396,56 +399,58 @@ class LatentReasoningTrainer:
                     print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
 
                     # Gradient decomposition: thought positions vs answer positions
+                    # NOTE: .item() calls force XLA graph execution (sync).
+                    # On XLA we keep everything as tensors and only call .item()
+                    # at logging time to avoid blocking the TPU pipeline.
                     decode_input = outputs.get("decode_input")
+                    thought_mean_t = torch.tensor(0.0)
+                    answer_mean_t = torch.tensor(0.0)
                     if decode_input is not None and decode_input.grad is not None:
+                        t_gd = time.perf_counter()
                         grad = decode_input.grad
                         t_start, t_end = outputs["thought_positions"]
                         a_start = outputs["answer_positions"][0]
-                        # Per-position L2 norms, averaged over batch
                         thought_grad = grad[:, t_start:t_end, :]
                         answer_grad = grad[:, a_start:, :]
-                        # Mean per-position norm (normalized by position count)
-                        thought_mean = thought_grad.norm(dim=-1).mean().item()
-                        answer_mean = answer_grad.norm(dim=-1).mean().item()
-                        # Total L2 norm (unnormalized)
-                        thought_total = thought_grad.norm().item()
-                        answer_total = answer_grad.norm().item()
-                        stitch_debug["grad/thought_mean_norm"] = thought_mean
-                        stitch_debug["grad/answer_mean_norm"] = answer_mean
-                        denom_mean = thought_mean + answer_mean
-                        if denom_mean > 0:
-                            stitch_debug["grad/thought_pct_per_pos"] = thought_mean / denom_mean
-                        denom_total = thought_total + answer_total
-                        if denom_total > 0:
-                            stitch_debug["grad/thought_pct_total"] = thought_total / denom_total
+                        thought_mean_t = thought_grad.norm(dim=-1).mean()
+                        answer_mean_t = answer_grad.norm(dim=-1).mean()
+                        thought_total_t = thought_grad.norm()
+                        answer_total_t = answer_grad.norm()
+                        # Defer .item() — store tensors for now
+                        stitch_debug["_thought_mean_t"] = thought_mean_t
+                        stitch_debug["_answer_mean_t"] = answer_mean_t
+                        stitch_debug["_thought_total_t"] = thought_total_t
+                        stitch_debug["_answer_total_t"] = answer_total_t
+                        print(f"[grad_decomp] {time.perf_counter()-t_gd:.2f}s", flush=True)
 
                     t_stitch = time.perf_counter()
                     for d in range(D):
+                        t_d = time.perf_counter()
                         # Extract gradients at thought input boundaries
                         g = [t.grad.detach().clone() if t.grad is not None
                              else torch.zeros_like(t) for t in thought_inputs]
                         for t in thought_inputs:
                             t.grad = None
+                        print(f"[stitch d={d}] grad extract {time.perf_counter()-t_d:.2f}s", flush=True)
 
-                        # On first iteration, log how much the answer loss depends
-                        # on thought content (L2 norm of dLoss/dThoughts)
+                        # On first iteration, store sensitivity tensor (no .item())
                         if d == 0:
-                            g_norms = [gk.norm().item() for gk in g]
-                            stitch_debug["thought_sensitivity"] = sum(n**2 for n in g_norms)**0.5
-                            if answer_mean > 0 and K > 0:
-                                stitch_debug["grad/thought_sensitivity_vs_answer"] = (
-                                    stitch_debug["thought_sensitivity"] / (answer_mean * K)
-                                )
+                            g_sq_sum = sum(gk.norm().pow(2) for gk in g)
+                            stitch_debug["_thought_sensitivity_t"] = g_sq_sum.sqrt()
 
                         # Stitch: inject gradients into thought output positions.
+                        t_ls = time.perf_counter()
                         L_stitch = (1 - p) * sum(
                             (g[k] * thought_outputs[k]).sum()
                             for k in range(len(g))
                         )
+                        print(f"[stitch d={d}] L_stitch compute {time.perf_counter()-t_ls:.2f}s", flush=True)
 
+                        t_sb = time.perf_counter()
                         retain = (d < D - 1)
                         L_stitch.backward(retain_graph=retain)
-                    print(f"[stitch] D={D}, {time.perf_counter()-t_stitch:.2f}s", flush=True)
+                        print(f"[stitch d={d}] backward {time.perf_counter()-t_sb:.2f}s", flush=True)
+                    print(f"[stitch] D={D} total {time.perf_counter()-t_stitch:.2f}s", flush=True)
                 else:
                     t_back = time.perf_counter()
                     loss.backward()
@@ -453,36 +458,53 @@ class LatentReasoningTrainer:
 
                 self._stitch_debug = stitch_debug
                 self._last_thought_token_ids = outputs.get("thought_token_ids")
-                accum_loss += loss.item()
+                # loss.item() forces XLA sync — defer to logging time on XLA
+                if self.use_xla:
+                    t_li = time.perf_counter()
+                    accum_loss += loss.detach()  # keep on device
+                    print(f"[accum_loss detach] {time.perf_counter()-t_li:.2f}s", flush=True)
+                else:
+                    accum_loss += loss.item()
                 micro_step += 1
 
                 # Optimizer step every grad_accum_steps micro-batches
                 if micro_step % self.grad_accum_steps == 0:
-                    # Measure model grad norm after stitching (answer + stitch combined).
-                    # Compare with grad_decomposition/answer_loss to see how much
-                    # stitching contributed to the total gradient.
                     # Gradient clipping
+                    t_clip = time.perf_counter()
                     grad_norm = self._clip_grad_norm()
+                    print(f"[clip_grad] {time.perf_counter()-t_clip:.2f}s", flush=True)
 
-                    # Optimizer step (XLA needs mark_step)
+                    # Optimizer step (XLA needs mark_step which triggers graph execution)
                     t_opt = time.perf_counter()
                     if self.use_xla:
+                        print("[optim] calling xm.optimizer_step...", flush=True)
                         self._xla_step()
+                        print(f"[optim] xla_step done {time.perf_counter()-t_opt:.2f}s", flush=True)
                     else:
                         self.optimizer.step()
                         self.scheduler.step()
+                    t_zero = time.perf_counter()
                     self.optimizer.zero_grad()
+                    print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
                     self.optimizer_step += 1
-                    print(f"[optim] {time.perf_counter()-t_opt:.2f}s", flush=True)
+                    print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
 
                     # Accumulate stats for logging window
-                    log_loss += accum_loss
+                    # On XLA, accum_loss is a device tensor — materialize here
+                    # (after mark_step so we don't stall mid-graph)
+                    t_sync = time.perf_counter()
+                    if self.use_xla:
+                        log_loss += accum_loss.item() if isinstance(accum_loss, torch.Tensor) else accum_loss
+                    else:
+                        log_loss += accum_loss
+                    print(f"[loss_sync] {time.perf_counter()-t_sync:.2f}s", flush=True)
                     log_grad_norm += grad_norm
                     log_steps += 1
                     accum_loss = 0.0
 
                     # Logging (based on optimizer steps)
                     if self.is_main and self.optimizer_step % log_every == 0:
+                        t_log = time.perf_counter()
                         avg_loss = log_loss / log_steps
                         avg_grad_norm = log_grad_norm / log_steps
                         step_time = time.monotonic() - step_start_time
@@ -504,9 +526,29 @@ class LatentReasoningTrainer:
                             "data/question_discard_rate": self.train_dataset.discard_rate,
                         }
                         log_dict["stitching/depth"] = self.stitching_depth
-                        # Per-thought latent gradient norms and stitching debug info
+                        # Materialize deferred stitch debug tensors for logging
                         if hasattr(self, '_stitch_debug'):
-                            log_dict.update(self._stitch_debug)
+                            sd = self._stitch_debug
+                            if "_thought_mean_t" in sd:
+                                thought_mean = sd["_thought_mean_t"].item()
+                                answer_mean = sd["_answer_mean_t"].item()
+                                thought_total = sd["_thought_total_t"].item()
+                                answer_total = sd["_answer_total_t"].item()
+                                log_dict["grad/thought_mean_norm"] = thought_mean
+                                log_dict["grad/answer_mean_norm"] = answer_mean
+                                denom_mean = thought_mean + answer_mean
+                                if denom_mean > 0:
+                                    log_dict["grad/thought_pct_per_pos"] = thought_mean / denom_mean
+                                denom_total = thought_total + answer_total
+                                if denom_total > 0:
+                                    log_dict["grad/thought_pct_total"] = thought_total / denom_total
+                            if "_thought_sensitivity_t" in sd:
+                                sensitivity = sd["_thought_sensitivity_t"].item()
+                                log_dict["thought_sensitivity"] = sensitivity
+                                if answer_mean > 0 and K > 0:
+                                    log_dict["grad/thought_sensitivity_vs_answer"] = (
+                                        sensitivity / (answer_mean * K)
+                                    )
                         if torch.cuda.is_available():
                             log_dict["system/gpu_memory_allocated_gb"] = (
                                 torch.cuda.max_memory_allocated(self.device) / 1e9
@@ -518,6 +560,7 @@ class LatentReasoningTrainer:
                         if wandb is not None and wandb.run is not None:
                             wandb.log(log_dict, step=self.optimizer_step)
                         pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+                        print(f"[logging] {time.perf_counter()-t_log:.2f}s", flush=True)
 
                         # Print sample thought tokens from first example in last batch
                         if self.tokenizer is not None and self._last_thought_token_ids is not None:
