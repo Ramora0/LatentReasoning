@@ -414,7 +414,10 @@ class LatentReasoningTrainer:
                         # g[k] flows into thought_outputs[k]:
                         #   thought_outputs[0] = <thinking> output (produces t_0)
                         #   thought_outputs[k] = t_{k-1} output (produces t_k)
-                        L_stitch = sum(
+                        # Scale by (1-p) to match the blending boundary:
+                        #   thought[k] = token_emb * p + hidden * (1-p)
+                        #   so ∂thought[k]/∂hidden = (1-p)
+                        L_stitch = (1 - p) * sum(
                             (g[k] * thought_outputs[k]).sum()
                             for k in range(len(g))
                         )

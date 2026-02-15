@@ -205,7 +205,8 @@ class TestLatentReasoningModel:
         for t in thought_inputs:
             t.grad = None
 
-        L_stitch = sum(
+        p = 0.5  # must match the p used in forward
+        L_stitch = (1 - p) * sum(
             (g[k] * thought_outputs[k]).sum()
             for k in range(len(g))
         )
