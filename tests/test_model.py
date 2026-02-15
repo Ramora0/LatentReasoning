@@ -63,7 +63,8 @@ class TestQuestionMasking:
 
     def test_causal_mask_structure(self):
         """Verify the 4D mask has correct causal + question-masking structure."""
-        B, seq_len, q_len = 2, 10, 3
+        # q_len=4 covers question tokens (0,1,2) + <thinking> (3)
+        B, seq_len, q_len = 2, 10, 4
         answer_start = 7  # positions 7,8,9 are answer marker + answer tokens
         dtype = torch.float32
         device = torch.device("cpu")

@@ -410,8 +410,10 @@ class LatentReasoningModel(nn.Module):
             decode_mask = torch.cat(
                 [prefix_mask, answer_mask[:, :-1]], dim=1
             )
-            # Build 4D mask hiding question tokens from answer positions
-            q_len = self._thought_output_start  # positions 0..q_len-1 are question tokens
+            # Build 4D mask hiding question + <thinking> tokens from answer positions.
+            # _thought_output_start is q_len_orig (the <thinking> position), so +1
+            # masks columns 0..q_len_orig inclusive, leaving only thought vectors visible.
+            q_len = self._thought_output_start + 1  # hide question tokens AND <thinking>
             answer_start = latent_states.shape[1] - 1  # <answer> marker position
             decode_mask_4d = self._build_question_masked_causal_mask(
                 decode_mask, q_len, answer_start, decode_input.dtype, decode_input.device
@@ -560,7 +562,7 @@ class LatentReasoningModel(nn.Module):
 
         # Phase 1: Encode
         hidden_states = self.phase1_encode(question_ids)
-        q_len_orig = hidden_states.shape[1]  # question positions to mask from answers
+        q_len_orig = hidden_states.shape[1] + 1  # question + <thinking> positions to mask from answers
 
         # Insert <thinking> token
         thinking_marker = self.thinking_token_emb.expand(B, -1, -1)

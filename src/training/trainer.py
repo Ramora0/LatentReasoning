@@ -36,12 +36,13 @@ class LatentReasoningTrainer:
     Supports both CUDA (GPU/NCCL) and XLA (TPU) backends via config.distributed.backend.
     """
 
-    def __init__(self, config, model, train_dataset, collator, evaluator=None):
+    def __init__(self, config, model, train_dataset, collator, evaluator=None, tokenizer=None):
         self.config = config
         self.model = model
         self.train_dataset = train_dataset
         self.collator = collator
         self.evaluator = evaluator
+        self.tokenizer = tokenizer
         self.K = config.latent.K
         stitching_depth = getattr(config.latent, "stitching_depth", None)
         self.stitching_depth = stitching_depth if stitching_depth is not None else self.K
@@ -429,6 +430,8 @@ class LatentReasoningTrainer:
                     loss.backward()
 
                 self._stitch_debug = stitch_debug
+                self._last_batch = batch
+                self._last_logits = outputs["logits"].detach()
                 accum_loss += loss.item()
                 micro_step += 1
 
@@ -489,6 +492,22 @@ class LatentReasoningTrainer:
                         if wandb is not None and wandb.run is not None:
                             wandb.log(log_dict, step=self.optimizer_step)
                         pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+
+                        # Print sample decoded tokens from first example in last batch
+                        if self.tokenizer is not None and hasattr(self, '_last_logits'):
+                            try:
+                                pred_ids = self._last_logits[0].argmax(dim=-1)
+                                target_ids = self._last_batch["answer_ids"][0]
+                                target_mask = self._last_batch["answer_mask"][0]
+                                # Only show tokens where mask is 1 (real answer tokens)
+                                real = target_mask.bool()
+                                target_toks = self.tokenizer.decode(target_ids[real], skip_special_tokens=False)
+                                pred_toks = self.tokenizer.decode(pred_ids[real], skip_special_tokens=False)
+                                print(f"\n  [sample] target: {target_toks[:120]}")
+                                print(f"  [sample] pred:   {pred_toks[:120]}")
+                            except Exception:
+                                pass
+
                         log_loss = 0.0
                         log_grad_norm = 0.0
                         log_steps = 0

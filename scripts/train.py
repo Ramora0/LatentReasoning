@@ -175,6 +175,7 @@ def _train_fn(rank_unused, config):
         train_dataset=train_dataset,
         collator=collator,
         evaluator=evaluator,
+        tokenizer=tokenizer,
     )
 
     if rank == 0:
