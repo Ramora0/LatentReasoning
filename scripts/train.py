@@ -193,8 +193,11 @@ def main():
 
     if backend == "xla":
         import torch_xla.distributed.xla_multiprocessing as xmp
-        # xmp.spawn launches one process per TPU core; nprocs=None auto-detects
-        xmp.spawn(_train_fn, args=(config,), nprocs=None)
+        import torch_xla.runtime as xr
+        # xmp.spawn launches one process per TPU core
+        num_devices = xr.global_runtime_device_count()
+        print(f"Launching on {num_devices} XLA devices...")
+        xmp.spawn(_train_fn, args=(config,), nprocs=num_devices)
     else:
         _train_fn(0, config)
 
