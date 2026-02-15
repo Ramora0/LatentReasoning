@@ -196,32 +196,27 @@ class LatentReasoningTrainer:
         return model
 
     def _wrap_xla_fsdp(self, model):
-        """Wrap model with XLA FSDP for TPU."""
+        """Wrap model with XLA FSDP for TPU.
+
+        Uses outer-only FSDP (no per-layer wrapping) to stay compatible with
+        retain_graph=True needed by gradient stitching.  Nested XLA FSDP tracks
+        per-module backward state that breaks when the graph is traversed twice.
+        Gemma 2 2B is small enough for outer-only sharding on v4-8.
+        """
         from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as XlaFSDP
 
         # Move model to XLA device first
         model = model.to(self.device)
 
-        # XLA FSDP's recursive_wrap passes different kwargs than CUDA FSDP,
-        # so we use a simple callable instead of transformer_auto_wrap_policy.
-        def auto_wrap_policy(module, recurse, **kwargs):
-            if recurse:
-                return True  # always recurse into children
-            return isinstance(module, Gemma2DecoderLayer)
-
+        # Outer-only wrap — no auto_wrap_policy so inner decoder layers are
+        # NOT individually wrapped.  This avoids the BACKWARD_PRE/POST state
+        # conflict when retain_graph=True is used for gradient stitching.
         model = XlaFSDP(
             model,
-            auto_wrap_policy=auto_wrap_policy,
             compute_dtype=torch.bfloat16,
             shard_param_on_dim_0=True,
             pin_layout_in_collective_ops=True,
         )
-
-        # NOTE: XLA per-layer activation checkpointing (checkpoint_module) is
-        # intentionally skipped. It conflicts with KV cache use inside phase2
-        # (SlidingWindowCache breaks on recompute for short sequences). The model
-        # already wraps the entire phase2 with torch_xla checkpoint, which
-        # provides equivalent memory savings without the cache conflict.
 
         return model
 
