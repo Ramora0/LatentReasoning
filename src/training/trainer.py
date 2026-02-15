@@ -74,8 +74,12 @@ class LatentReasoningTrainer:
         # Autocast device type
         self._autocast_device = "xla" if self.use_xla else "cuda"
 
-        # Wrap model with FSDP if distributed
-        if self.is_distributed and config.distributed.fsdp:
+        # Wrap model with FSDP if distributed (CUDA only).
+        # On XLA, skip FSDP — Gemma 2 2B fits on each TPU chip and
+        # xm.optimizer_step handles gradient all-reduce automatically.
+        # XLA FSDP's flatten-params wrapper breaks with retain_graph=True
+        # (needed for gradient stitching) and with 1D norm parameters.
+        if self.is_distributed and config.distributed.fsdp and not self.use_xla:
             self.model = self._wrap_fsdp(model)
         else:
             self.model = model.to(self.device)
@@ -283,13 +287,10 @@ class LatentReasoningTrainer:
         max_norm = self.config.training.max_grad_norm
 
         if self.use_xla:
-            from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as XlaFSDP
-            if isinstance(self.model, XlaFSDP):
-                grad_norm = self.model.clip_grad_norm_(max_norm)
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm
-                )
+            # No XLA FSDP — model is plain, use standard clip
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm
+            )
             return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         else:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -666,15 +667,10 @@ class LatentReasoningTrainer:
             )
 
     def _save_checkpoint_xla(self, ckpt_path: Path):
-        """Save checkpoint for XLA/TPU backend."""
+        """Save checkpoint for XLA/TPU backend (no FSDP, plain model)."""
         import torch_xla.core.xla_model as xm
-        from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as XlaFSDP
 
-        # Consolidate sharded state on host (rank 0)
-        if isinstance(self.model, XlaFSDP):
-            model_state = self.model.state_dict()
-        else:
-            model_state = self.model.state_dict()
+        model_state = self.model.state_dict()
 
         if self.is_main:
             ckpt_path.mkdir(parents=True, exist_ok=True)
