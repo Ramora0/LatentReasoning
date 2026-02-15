@@ -157,7 +157,17 @@ def _train_fn(rank_unused, config):
         max_answer_tokens=config.data.max_answer_tokens,
         data_dir=dataset_path,
     )
-    collator = LatentReasoningCollator(tokenizer=tokenizer)
+    # On XLA/TPU, pad to fixed lengths so every batch has identical tensor shapes
+    # and XLA doesn't recompile the graph each step.
+    backend = getattr(config.distributed, "backend", "cuda")
+    if backend == "xla":
+        collator = LatentReasoningCollator(
+            tokenizer=tokenizer,
+            fixed_question_len=config.data.max_question_tokens,
+            fixed_answer_len=config.data.max_answer_tokens,
+        )
+    else:
+        collator = LatentReasoningCollator(tokenizer=tokenizer)
 
     # Build model
     if rank == 0:

@@ -510,7 +510,7 @@ class LatentReasoningModel(nn.Module):
         loss, logits = self.phase3_decode(
             hidden_states, extended_mask, answer_ids, answer_mask,
         )
-        print(f"[forward] {time.perf_counter()-t_start:.2f}s, loss={loss.item():.4f}", flush=True)
+        print(f"[forward] {time.perf_counter()-t_start:.2f}s", flush=True)
 
         result = {"loss": loss, "logits": logits}
         result["thought_token_ids"] = getattr(self, '_thought_token_ids', None)

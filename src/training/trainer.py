@@ -550,6 +550,14 @@ class LatentReasoningTrainer:
                                     log_dict["grad/thought_sensitivity_vs_answer"] = (
                                         sensitivity / (answer_mean * K)
                                     )
+                        if self.use_xla:
+                            import torch_xla.debug.metrics as met
+                            compile_data = met.metric_data('CompileTime')
+                            if compile_data:
+                                log_dict["xla/compile_count"] = compile_data[1]
+                                log_dict["xla/compile_time_s"] = compile_data[0] / 1e9
+                                print(f"  [XLA] compilations={compile_data[1]}, "
+                                      f"compile_time={compile_data[0]/1e9:.1f}s")
                         if torch.cuda.is_available():
                             log_dict["system/gpu_memory_allocated_gb"] = (
                                 torch.cuda.max_memory_allocated(self.device) / 1e9

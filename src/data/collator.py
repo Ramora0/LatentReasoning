@@ -8,6 +8,10 @@ class LatentReasoningCollator:
     """Pads question and answer sequences independently for latent reasoning."""
 
     tokenizer: PreTrainedTokenizer
+    # Fixed padding lengths — when set, every batch has identical tensor shapes,
+    # which is critical for XLA/TPU to avoid recompilation.
+    fixed_question_len: int | None = None
+    fixed_answer_len: int | None = None
 
     def __call__(self, batch: list[dict]) -> dict | None:
         # Filter out discarded samples (None from dataset)
@@ -15,9 +19,9 @@ class LatentReasoningCollator:
         if not batch:
             return None
 
-        # Find max lengths in this batch
-        max_q_len = max(item["question_len"] for item in batch)
-        max_a_len = max(item["answer_len"] for item in batch)
+        # Use fixed lengths when set (XLA), otherwise dynamic per-batch lengths
+        max_q_len = self.fixed_question_len or max(item["question_len"] for item in batch)
+        max_a_len = self.fixed_answer_len or max(item["answer_len"] for item in batch)
 
         pad_id = self.tokenizer.pad_token_id
         if pad_id is None:
