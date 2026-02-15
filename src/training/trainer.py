@@ -278,20 +278,21 @@ class LatentReasoningTrainer:
 
     # ---- Gradient clipping (backend-aware) ----
 
-    def _clip_grad_norm(self) -> float:
+    def _clip_grad_norm(self):
         """Clip gradient norms, returning the total norm.
 
-        On XLA we still call .item() here because clip_grad_norm_ needs
-        the value for the clipping decision. This is one unavoidable sync.
+        On XLA, returns the tensor without .item() to avoid forcing graph
+        materialization (which creates a memory spike). The value is
+        materialized later at logging time after mark_step.
         """
         max_norm = self.config.training.max_grad_norm
 
         if self.use_xla:
             # No XLA FSDP — model is plain, use standard clip
-            grad_norm = torch.nn.utils.clip_grad_norm_(
+            # Return tensor — defer .item() to logging time
+            return torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), max_norm
             )
-            return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         else:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
             if self.is_distributed and isinstance(self.model, FSDP):
@@ -499,7 +500,7 @@ class LatentReasoningTrainer:
                     else:
                         log_loss += accum_loss
                     print(f"[loss_sync] {time.perf_counter()-t_sync:.2f}s", flush=True)
-                    log_grad_norm += grad_norm
+                    log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
                     log_steps += 1
                     accum_loss = 0.0
 

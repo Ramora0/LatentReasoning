@@ -64,8 +64,7 @@ class BigMathDataset(Dataset):
 
         answer_enc = self.tokenizer(
             answer,
-            truncation=True,
-            max_length=self.max_answer_tokens,
+            truncation=False,
             add_special_tokens=False,
             return_tensors="pt",
         )
@@ -74,6 +73,11 @@ class BigMathDataset(Dataset):
         # Append EOS token to answer
         eos = torch.tensor([self.tokenizer.eos_token_id], dtype=answer_ids.dtype)
         answer_ids = torch.cat([answer_ids, eos])
+
+        # Discard answers that exceed max length (truncating loses gradient signal)
+        if len(answer_ids) > self.max_answer_tokens:
+            self._discarded += 1
+            return None
 
         return {
             "question_ids": question_ids,

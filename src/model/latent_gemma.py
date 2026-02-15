@@ -28,8 +28,8 @@ class LatentReasoningModel(nn.Module):
         self.use_xla = backend == "xla"
         attn_impl = "eager" if self.use_xla else "sdpa"
 
-        # XLA FSDP requires fp32 params (it casts to compute_dtype internally)
-        model_dtype = torch.float32 if backend == "xla" else torch.bfloat16
+        # bf16 for both backends — XLA FSDP is not used so fp32 is unnecessary
+        model_dtype = torch.bfloat16
 
         self.base_model = AutoModelForCausalLM.from_pretrained(
             config.model.name,
