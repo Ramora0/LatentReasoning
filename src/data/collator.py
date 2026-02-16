@@ -14,6 +14,7 @@ class LatentReasoningCollator:
     fixed_answer_len: int | None = None
 
     def __call__(self, batch: list[dict]) -> dict | None:
+        original_size = len(batch)
         # Filter out discarded samples (None from dataset)
         batch = [item for item in batch if item is not None]
         if not batch:
@@ -58,6 +59,23 @@ class LatentReasoningCollator:
             question_mask_list.append(q_mask)
             answer_mask_list.append(a_mask)
             labels_list.append(labels)
+
+        # When using fixed lengths (XLA/TPU), pad batch back to original size
+        # with dummy all-padding samples.  All-zero masks produce zero loss
+        # (labels are -100 everywhere), so these don't affect training but keep
+        # the batch dimension constant to prevent XLA recompilation.
+        if self.fixed_question_len is not None and len(question_ids_list) < original_size:
+            dummy_q = torch.full((max_q_len,), pad_id, dtype=question_ids_list[0].dtype)
+            dummy_q_mask = torch.zeros(max_q_len, dtype=torch.long)
+            dummy_a = torch.full((max_a_len,), pad_id, dtype=answer_ids_list[0].dtype)
+            dummy_a_mask = torch.zeros(max_a_len, dtype=torch.long)
+            dummy_labels = torch.full((max_a_len,), -100, dtype=labels_list[0].dtype)
+            for _ in range(original_size - len(question_ids_list)):
+                question_ids_list.append(dummy_q)
+                question_mask_list.append(dummy_q_mask)
+                answer_ids_list.append(dummy_a)
+                answer_mask_list.append(dummy_a_mask)
+                labels_list.append(dummy_labels)
 
         return {
             "question_ids": torch.stack(question_ids_list),

@@ -6,6 +6,7 @@ import functools
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
@@ -540,6 +541,7 @@ class LatentReasoningTrainer:
         log_thought_total = 0.0
         log_answer_total = 0.0
         log_sensitivity = 0.0
+        log_thought_token_sim = 0.0
         log_grad_decomp_steps = 0  # may differ from log_steps if some steps lack grad info
         step_start_time = time.monotonic()
 
@@ -602,11 +604,13 @@ class LatentReasoningTrainer:
 
                     accum_loss, log_loss, log_grad_norm, log_steps, \
                         log_thought_mean, log_answer_mean, log_thought_total, \
-                        log_answer_total, log_sensitivity, log_grad_decomp_steps, \
+                        log_answer_total, log_sensitivity, log_thought_token_sim, \
+                        log_grad_decomp_steps, \
                         step_start_time = self._do_optimizer_step(
                             accum_loss, log_loss, log_grad_norm, log_steps,
                             log_thought_mean, log_answer_mean, log_thought_total,
-                            log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                            log_answer_total, log_sensitivity, log_thought_token_sim,
+                            log_grad_decomp_steps,
                             step_start_time, 0, 0.0, epoch, pbar,
                             max_steps, log_every, eval_every, save_every,
                         )
@@ -699,11 +703,13 @@ class LatentReasoningTrainer:
                     # Optimizer step
                     accum_loss, log_loss, log_grad_norm, log_steps, \
                         log_thought_mean, log_answer_mean, log_thought_total, \
-                        log_answer_total, log_sensitivity, log_grad_decomp_steps, \
+                        log_answer_total, log_sensitivity, log_thought_token_sim, \
+                        log_grad_decomp_steps, \
                         step_start_time = self._do_optimizer_step(
                             accum_loss, log_loss, log_grad_norm, log_steps,
                             log_thought_mean, log_answer_mean, log_thought_total,
-                            log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                            log_answer_total, log_sensitivity, log_thought_token_sim,
+                            log_grad_decomp_steps,
                             step_start_time, K, p, epoch, pbar,
                             max_steps, log_every, eval_every, save_every,
                         )
@@ -750,11 +756,13 @@ class LatentReasoningTrainer:
                     # Optimizer step (always, since grad_accum_steps == 1)
                     accum_loss, log_loss, log_grad_norm, log_steps, \
                         log_thought_mean, log_answer_mean, log_thought_total, \
-                        log_answer_total, log_sensitivity, log_grad_decomp_steps, \
+                        log_answer_total, log_sensitivity, log_thought_token_sim, \
+                        log_grad_decomp_steps, \
                         step_start_time = self._do_optimizer_step(
                             accum_loss, log_loss, log_grad_norm, log_steps,
                             log_thought_mean, log_answer_mean, log_thought_total,
-                            log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                            log_answer_total, log_sensitivity, log_thought_token_sim,
+                            log_grad_decomp_steps,
                             step_start_time, K, p, epoch, pbar,
                             max_steps, log_every, eval_every, save_every,
                         )
@@ -773,7 +781,8 @@ class LatentReasoningTrainer:
 
     def _do_optimizer_step(self, accum_loss, log_loss, log_grad_norm, log_steps,
                            log_thought_mean, log_answer_mean, log_thought_total,
-                           log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                           log_answer_total, log_sensitivity, log_thought_token_sim,
+                           log_grad_decomp_steps,
                            step_start_time, K, p, epoch, pbar,
                            max_steps, log_every, eval_every, save_every):
         """Execute optimizer step, logging, eval, and checkpoint. Returns updated accumulators."""
@@ -839,6 +848,8 @@ class LatentReasoningTrainer:
                     log_answer_total += sd["_answer_total_t"].item()
                 if "_thought_sensitivity_t" in sd:
                     log_sensitivity += sd["_thought_sensitivity_t"].item()
+                if "_thought_token_cos_sim" in sd:
+                    log_thought_token_sim += sd["_thought_token_cos_sim"].item()
             log_grad_decomp_steps += 1
 
         # Logging (based on optimizer steps)
@@ -892,6 +903,7 @@ class LatentReasoningTrainer:
                     log_dict["grad/thought_sensitivity_vs_answer"] = (
                         sensitivity / (answer_mean * K)
                     )
+                log_dict["thought/token_cos_sim"] = log_thought_token_sim / log_grad_decomp_steps
             if self.use_xla:
                 import torch_xla.debug.metrics as met
                 compile_data = met.metric_data('CompileTime')
@@ -940,6 +952,7 @@ class LatentReasoningTrainer:
             log_thought_total = 0.0
             log_answer_total = 0.0
             log_sensitivity = 0.0
+            log_thought_token_sim = 0.0
             log_grad_decomp_steps = 0
             step_start_time = time.monotonic()
 
@@ -956,7 +969,8 @@ class LatentReasoningTrainer:
 
         return (accum_loss, log_loss, log_grad_norm, log_steps,
                 log_thought_mean, log_answer_mean, log_thought_total,
-                log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                log_answer_total, log_sensitivity, log_thought_token_sim,
+                log_grad_decomp_steps,
                 step_start_time)
 
     def _run_eval(self, K, p):
