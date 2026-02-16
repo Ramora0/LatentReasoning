@@ -37,7 +37,8 @@ class LatentReasoningTrainer:
     Supports both CUDA (GPU/NCCL) and XLA (TPU) backends via config.distributed.backend.
     """
 
-    def __init__(self, config, model, train_dataset, collator, evaluator=None, tokenizer=None):
+    def __init__(self, config, model, train_dataset, collator, evaluator=None, tokenizer=None,
+                 resume_path=None):
         self.config = config
         self.model = model
         self.train_dataset = train_dataset
@@ -75,6 +76,20 @@ class LatentReasoningTrainer:
         # Autocast device type
         self._autocast_device = "xla" if self.use_xla else "cuda"
 
+        # Load checkpoint model weights before FSDP wrapping (FSDP expects full state).
+        # For XLA (no FSDP), load after .to(device).
+        resume_ckpt = None
+        if resume_path is not None:
+            ckpt_file = os.path.join(resume_path, "checkpoint.pt")
+            if self.is_main:
+                print(f"Loading checkpoint from {ckpt_file}...")
+            resume_ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+            if not self.use_xla:
+                # Load weights on CPU before FSDP wrapping
+                model.load_state_dict(resume_ckpt["model_state_dict"])
+                if self.is_main:
+                    print("Loaded model state dict (pre-FSDP)")
+
         # Wrap model with FSDP if distributed (CUDA only).
         # On XLA, skip FSDP — Gemma 2 2B fits on each TPU chip and
         # xm.optimizer_step handles gradient all-reduce automatically.
@@ -84,6 +99,12 @@ class LatentReasoningTrainer:
             self.model = self._wrap_fsdp(model)
         else:
             self.model = model.to(self.device)
+
+        # For XLA, load model weights after .to(device)
+        if resume_ckpt is not None and self.use_xla:
+            self.model.load_state_dict(resume_ckpt["model_state_dict"])
+            if self.is_main:
+                print("Loaded model state dict (XLA)")
 
         # Build optimizer with two param groups
         self.optimizer = self._build_optimizer()
@@ -128,8 +149,25 @@ class LatentReasoningTrainer:
             print(f"  log every {self.log_every} steps, eval every {self.eval_every} steps, "
                   f"save every {self.save_every} steps")
 
+        # Restore optimizer/scheduler/step from checkpoint
+        if resume_ckpt is not None:
+            if resume_ckpt.get("optimizer_state_dict") is not None:
+                self.optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+                if self.is_main:
+                    print("Loaded optimizer state dict")
+            if resume_ckpt.get("scheduler_state_dict") is not None:
+                self.scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+                if self.is_main:
+                    print("Loaded scheduler state dict")
+            self.optimizer_step = resume_ckpt.get("optimizer_step", 0)
+            if self.is_main:
+                print(f"Resuming from optimizer step {self.optimizer_step}")
+            resume_ckpt = None  # free memory
+        else:
+            self.optimizer_step = 0
+
         # State
-        self.optimizer_step = 0
+        self._resume_step = self.optimizer_step
         self._prev_compile_count = 0
         self._prev_compile_time_ns = 0
         # Per-mark_step compilation tracking
@@ -553,6 +591,17 @@ class LatentReasoningTrainer:
         log_grad_decomp_steps = 0  # may differ from log_steps if some steps lack grad info
         step_start_time = time.monotonic()
 
+        # Compute resumption offsets
+        steps_per_epoch = len(self.dataloader) // self.grad_accum_steps
+        start_epoch = self.optimizer_step // steps_per_epoch if steps_per_epoch > 0 else 0
+        skip_steps = self.optimizer_step % steps_per_epoch if steps_per_epoch > 0 else 0
+        skip_micro_batches = skip_steps * self.grad_accum_steps
+
+        if self.optimizer_step > 0 and self.is_main:
+            print(f"Resuming: skipping to epoch {start_epoch}, "
+                  f"then skipping {skip_steps} optimizer steps "
+                  f"({skip_micro_batches} micro-batches)")
+
         pbar = tqdm(
             total=max_steps,
             desc="Training",
@@ -560,7 +609,7 @@ class LatentReasoningTrainer:
         )
         pbar.update(self.optimizer_step)
 
-        for epoch in range(self.num_epochs):
+        for epoch in range(start_epoch, self.num_epochs):
             # Set epoch for distributed sampler (shuffles differently each epoch)
             if self.is_distributed and hasattr(self.dataloader, "sampler"):
                 sampler = self.dataloader.sampler
@@ -573,9 +622,26 @@ class LatentReasoningTrainer:
             else:
                 epoch_loader = self.dataloader
 
+            # Skip micro-batches already processed in the resume epoch
+            if epoch == start_epoch and skip_micro_batches > 0:
+                if self.is_main:
+                    print(f"Skipping {skip_micro_batches} micro-batches in epoch {epoch}...")
+                epoch_loader_iter = iter(epoch_loader)
+                for _ in range(skip_micro_batches):
+                    try:
+                        next(epoch_loader_iter)
+                    except StopIteration:
+                        break
+                # For paths that create their own iter, we need to pass this along.
+                # We use a flag to indicate we already have a partially-consumed iterator.
+                _resumed_iter = epoch_loader_iter
+                skip_micro_batches = 0  # only skip once
+            else:
+                _resumed_iter = None
+
             if self.K == 0:
                 # Baseline mode: no latent steps, no stitching, simple forward+backward
-                epoch_loader_iter = iter(epoch_loader)
+                epoch_loader_iter = _resumed_iter or iter(epoch_loader)
                 while True:
                     micro_batches = self._collect_micro_batches(
                         epoch_loader_iter, self.grad_accum_steps
@@ -627,7 +693,7 @@ class LatentReasoningTrainer:
             elif self.grad_accum_steps > 1:
                 # Batched generation path: collect micro-batches, run Phase 1+2
                 # on the full batch, then split for Phase 3+backward+stitching
-                epoch_loader_iter = iter(epoch_loader)
+                epoch_loader_iter = _resumed_iter or iter(epoch_loader)
                 while True:
                     micro_batches = self._collect_micro_batches(
                         epoch_loader_iter, self.grad_accum_steps
@@ -736,7 +802,7 @@ class LatentReasoningTrainer:
 
             else:
                 # Single micro-batch path (grad_accum_steps == 1): use phase="all"
-                for batch in epoch_loader:
+                for batch in (_resumed_iter or epoch_loader):
                     if batch is None:
                         continue
 

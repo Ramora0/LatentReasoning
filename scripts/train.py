@@ -70,16 +70,18 @@ def _parse_config():
     """Parse CLI args and build OmegaConf config."""
     parser = argparse.ArgumentParser(description="Train latent reasoning model")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint dir to resume from (e.g. checkpoints/step_60000)")
     args, overrides = parser.parse_known_args()
 
     config = OmegaConf.load(args.config)
     if overrides:
         cli_conf = OmegaConf.from_dotlist(overrides)
         config = OmegaConf.merge(config, cli_conf)
-    return config
+    return config, args.resume
 
 
-def _train_fn(rank_unused, config):
+def _train_fn(rank_unused, config, resume_path=None):
     """Training function run by each process.
 
     For XLA this is called via xmp.spawn (rank_unused is the index arg
@@ -186,6 +188,7 @@ def _train_fn(rank_unused, config):
         collator=collator,
         evaluator=evaluator,
         tokenizer=tokenizer,
+        resume_path=resume_path,
     )
 
     if rank == 0:
@@ -198,7 +201,7 @@ def _train_fn(rank_unused, config):
 
 
 def main():
-    config = _parse_config()
+    config, resume_path = _parse_config()
     backend = getattr(config.distributed, "backend", "cuda")
 
     if backend == "xla":
@@ -207,9 +210,9 @@ def main():
         # Do NOT call any XLA runtime APIs here — they initialize the
         # runtime and conflict with xmp.spawn's own initialization.
         print("Launching XLA training via xmp.spawn...")
-        xmp.spawn(_train_fn, args=(config,))
+        xmp.spawn(_train_fn, args=(config, resume_path))
     else:
-        _train_fn(0, config)
+        _train_fn(0, config, resume_path=resume_path)
 
 
 if __name__ == "__main__":
