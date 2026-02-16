@@ -10,6 +10,8 @@ latent:
   p_start: 0.0
   p_end: 0.0
   p_anneal_ratio: 0.8
+  question_anneal_start: 0.3  # fraction of total optimizer steps before question annealing begins
+  question_anneal_end: 0.9    # fraction of total optimizer steps at which q_visibility reaches 1.0
 
 training:
   batch_size_per_gpu: 4
@@ -38,7 +40,7 @@ data:
 
 eval:
   benchmarks: [gsm8k]
-  eval_every_samples: 32768
+  eval_every_samples: 65536
   max_new_tokens: 64
 
 logging:

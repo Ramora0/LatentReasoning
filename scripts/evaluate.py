@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--K", type=int, default=None, help="Override K (latent iterations)")
     parser.add_argument("--p", type=float, default=None, help="Override p (interpolation weight)")
     parser.add_argument("--benchmarks", nargs="+", default=None, help="Override benchmarks to run")
+    parser.add_argument("--q_visibility", type=float, default=None, help="Override q_visibility (question visibility)")
     args, overrides = parser.parse_known_args()
 
     config = OmegaConf.load(args.config)
@@ -78,12 +79,13 @@ def main():
     # Get K and p
     K = args.K if args.K is not None else ckpt.get("K", config.latent.K)
     p = args.p if args.p is not None else ckpt.get("p", 0.0)
+    q_vis = args.q_visibility if args.q_visibility is not None else ckpt.get("q_visibility", 1.0)
 
-    print(f"Evaluating with K={K}, p={p}")
+    print(f"Evaluating with K={K}, p={p}, q_visibility={q_vis}")
 
     # Run evaluation
     evaluator = Evaluator(config, tokenizer, device, eval_data_dir=eval_data_dir)
-    results = evaluator.evaluate(model, K=K, p=p)
+    results = evaluator.evaluate(model, K=K, p=p, q_visibility=q_vis)
 
     print("\nResults:")
     for benchmark, accuracy in results.items():

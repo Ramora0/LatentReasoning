@@ -457,17 +457,19 @@ class LatentReasoningTrainer:
         D = self.stitching_depth
         stitch_debug = {}
 
+        # Compute thought-token similarity: how close are latent thought
+        # hidden states to the embedding of the token they decode to?
+        # Measures how "on the token manifold" the latent representations are.
+        thought_token_ids = outputs.get("thought_token_ids")
+        if thought_inputs and thought_token_ids is not None:
+            with torch.no_grad():
+                raw_model = getattr(self.model, "module", self.model)
+                thought_cat = torch.cat(thought_inputs, dim=1)  # [B, K, d_model]
+                tok_emb = raw_model.embed_tokens(thought_token_ids)  # [B, K, d_model]
+                cos_sim = F.cosine_similarity(thought_cat, tok_emb, dim=-1)  # [B, K]
+                stitch_debug["_thought_token_cos_sim"] = cos_sim.mean()
+
         if thought_inputs and thought_outputs and D > 0:
-            # Compute thought-token similarity: how close are latent thoughts
-            # to their nearest decoded token embedding?
-            thought_token_ids = outputs.get("thought_token_ids")
-            if thought_token_ids is not None:
-                with torch.no_grad():
-                    raw_model = getattr(self.model, "module", self.model)
-                    thought_cat = torch.cat(thought_inputs, dim=1)  # [B, K, d_model]
-                    tok_emb = raw_model.embed_tokens(thought_token_ids) * raw_model.normalizer  # [B, K, d_model]
-                    cos_sim = F.cosine_similarity(thought_cat, tok_emb, dim=-1)  # [B, K]
-                    stitch_debug["_thought_token_cos_sim"] = cos_sim.mean()
 
             t_back = time.perf_counter()
             loss.backward(retain_graph=True)
@@ -607,6 +609,7 @@ class LatentReasoningTrainer:
 
                     self._stitch_debug = {}
                     self._last_thought_token_ids = None
+                    self._last_question_ids = batch["question_ids"][0]
 
                     accum_loss, log_loss, log_grad_norm, log_steps, \
                         log_thought_mean, log_answer_mean, log_thought_total, \
@@ -634,6 +637,7 @@ class LatentReasoningTrainer:
 
                     K = self.K
                     p = self.curriculum.get_p(self.optimizer_step)
+                    q_vis = self.curriculum.get_q_visibility(self.optimizer_step)
                     actual_accum = len(micro_batches)
 
                     # Merge micro-batches and run Phase 1+2 on big batch
@@ -662,6 +666,11 @@ class LatentReasoningTrainer:
                     answer_mask_chunks = torch.split(merged_batch["answer_mask"], split_sizes, dim=0)
 
                     thought_output_start = gen_outputs["thought_output_start"]
+                    thought_token_id_chunks = None
+                    if gen_outputs.get("thought_token_ids") is not None:
+                        thought_token_id_chunks = torch.split(
+                            gen_outputs["thought_token_ids"], split_sizes, dim=0
+                        )
 
                     # Phase 3 + backward + stitching for each micro-batch
                     for i in range(actual_accum):
@@ -687,7 +696,11 @@ class LatentReasoningTrainer:
                                 thought_output_start=thought_output_start,
                                 K_for_stitching=K,
                                 phase="decode",
+                                q_visibility=q_vis,
                             )
+
+                        if thought_token_id_chunks is not None:
+                            outputs["thought_token_ids"] = thought_token_id_chunks[i]
 
                         stitch_debug, loss = self._backward_and_stitch(
                             outputs, p, actual_accum
@@ -705,6 +718,7 @@ class LatentReasoningTrainer:
 
                     self._stitch_debug = stitch_debug
                     self._last_thought_token_ids = gen_outputs.get("thought_token_ids")
+                    self._last_question_ids = merged_batch["question_ids"][0]
 
                     # Optimizer step
                     accum_loss, log_loss, log_grad_norm, log_steps, \
@@ -731,6 +745,7 @@ class LatentReasoningTrainer:
 
                     K = self.K
                     p = self.curriculum.get_p(self.optimizer_step)
+                    q_vis = self.curriculum.get_q_visibility(self.optimizer_step)
 
                     with torch.autocast(
                         device_type=self._autocast_device,
@@ -744,12 +759,14 @@ class LatentReasoningTrainer:
                             answer_mask=batch["answer_mask"],
                             K=K,
                             p=p,
+                            q_visibility=q_vis,
                         )
 
                     stitch_debug, loss = self._backward_and_stitch(outputs, p, 1)
 
                     self._stitch_debug = stitch_debug
                     self._last_thought_token_ids = outputs.get("thought_token_ids")
+                    self._last_question_ids = batch["question_ids"][0]
                     if self.use_xla:
                         accum_loss += loss.detach()
                         # No mark_step here — let xm.optimizer_step() compile
@@ -890,6 +907,7 @@ class LatentReasoningTrainer:
                 "train/samples_per_sec": samples_per_sec,
                 "curriculum/K": K,
                 "curriculum/p": p,
+                "curriculum/q_visibility": self.curriculum.get_q_visibility(self.optimizer_step),
                 "data/question_discard_rate": self.train_dataset.discard_rate,
             }
             log_dict["stitching/depth"] = self.stitching_depth
@@ -947,10 +965,15 @@ class LatentReasoningTrainer:
             # Print sample thought tokens from first example in last batch
             if self.tokenizer is not None and self._last_thought_token_ids is not None:
                 try:
+                    if self._last_question_ids is not None:
+                        question_text = self.tokenizer.decode(
+                            self._last_question_ids, skip_special_tokens=True
+                        ).strip()
+                        print(f"\n  [sample] question: {question_text[:200]}")
                     thought_toks = self.tokenizer.decode(
                         self._last_thought_token_ids[0], skip_special_tokens=False
                     )
-                    print(f"\n  [sample] thoughts: {thought_toks[:200]}")
+                    print(f"  [sample] thoughts: {thought_toks[:200]}")
                 except Exception as e:
                     print(f"\n  [sample] decode error: {e}")
 
@@ -970,8 +993,10 @@ class LatentReasoningTrainer:
         if self.optimizer_step % save_every == 0:
             self._save_checkpoint()
 
-        # Evaluation
+        # Evaluation (always checkpoint before eval so a crash doesn't lose progress)
         if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
+            if self.optimizer_step % save_every != 0:
+                self._save_checkpoint()
             self._run_eval(K, p)
             self.model.train()
 
@@ -988,16 +1013,21 @@ class LatentReasoningTrainer:
         if self.evaluator is None:
             return
 
+        q_vis = self.curriculum.get_q_visibility(self.optimizer_step)
+        # Inference uses deterministic threshold: questions visible when q_vis >= 0.5
+        eval_q_visible = q_vis >= 0.5
+
         self.model.eval()
-        results = self.evaluator.evaluate(self.model, K=K, p=p)
+        results = self.evaluator.evaluate(self.model, K=K, p=p, q_visibility=q_vis)
 
         if self.is_main:
-            print(f"\n[Step {self.optimizer_step}] Eval results: {results}")
+            print(f"\n[Step {self.optimizer_step}] Eval results: {results} "
+                  f"(q_visibility={q_vis:.3f}, questions_visible={eval_q_visible})")
             if wandb is not None and wandb.run is not None:
-                wandb.log(
-                    {f"eval/{k}": v for k, v in results.items()},
-                    step=self.optimizer_step,
-                )
+                log_dict = {f"eval/{k}": v for k, v in results.items()}
+                log_dict["eval/q_visibility"] = q_vis
+                log_dict["eval/questions_visible"] = int(eval_q_visible)
+                wandb.log(log_dict, step=self.optimizer_step)
 
     # ---- Checkpointing (backend-aware) ----
 
@@ -1036,6 +1066,7 @@ class LatentReasoningTrainer:
                             "optimizer_step": self.optimizer_step,
                             "K": self.K,
                             "p": self.curriculum.get_p(self.optimizer_step),
+                            "q_visibility": self.curriculum.get_q_visibility(self.optimizer_step),
                         },
                         ckpt_path / "checkpoint.pt",
                     )
@@ -1049,6 +1080,7 @@ class LatentReasoningTrainer:
                     "optimizer_step": self.optimizer_step,
                     "K": self.K,
                     "p": self.curriculum.get_p(self.optimizer_step),
+                    "q_visibility": self.curriculum.get_q_visibility(self.optimizer_step),
                 },
                 ckpt_path / "checkpoint.pt",
             )
@@ -1070,6 +1102,7 @@ class LatentReasoningTrainer:
             "optimizer_step": self.optimizer_step,
             "K": self.K,
             "p": self.curriculum.get_p(self.optimizer_step),
+            "q_visibility": self.curriculum.get_q_visibility(self.optimizer_step),
         }
         xm.save(ckpt_data, str(ckpt_path / "checkpoint.pt"), master_only=True)
 

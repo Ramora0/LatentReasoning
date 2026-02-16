@@ -19,12 +19,17 @@ class Evaluator:
         self.benchmarks = config.eval.benchmarks
         self.eval_data_dir = eval_data_dir
 
-    def evaluate(self, model, K: int, p: float) -> dict:
+        self.use_xla = getattr(config.distributed, "backend", "cuda") == "xla"
+        if self.use_xla:
+            import torch_xla.core.xla_model as xm
+            self._xm = xm
+
+    def evaluate(self, model, K: int, p: float, q_visibility: float = 1.0) -> dict:
         """Run evaluation on all configured benchmarks."""
         results = {}
         for benchmark in self.benchmarks:
             if benchmark == "gsm8k":
-                acc, correct, total = self._eval_gsm8k(model, K, p)
+                acc, correct, total = self._eval_gsm8k(model, K, p, q_visibility)
                 results["gsm8k_accuracy"] = acc
                 results["gsm8k_correct"] = correct
                 results["gsm8k_total"] = total
@@ -41,7 +46,7 @@ class Evaluator:
         from datasets import load_dataset
         return load_dataset(hf_name, hf_config, split=split)
 
-    def _eval_gsm8k(self, model, K: int, p: float) -> float:
+    def _eval_gsm8k(self, model, K: int, p: float, q_visibility: float = 1.0) -> float:
         """Evaluate on GSM8K test set."""
         dataset = self._load_dataset("gsm8k", "gsm8k", hf_config="main")
         return self._eval_dataset(
@@ -49,6 +54,7 @@ class Evaluator:
             question_key="question",
             answer_key="answer",
             benchmark_name="GSM8K",
+            q_visibility=q_visibility,
         )
 
     def _eval_dataset(
@@ -60,6 +66,7 @@ class Evaluator:
         question_key: str,
         answer_key: str,
         benchmark_name: str,
+        q_visibility: float = 1.0,
     ) -> tuple[float, int, int]:
         """Evaluate model on a dataset of math problems.
 
@@ -98,7 +105,13 @@ class Evaluator:
                     K=K,
                     p=p,
                     max_new_tokens=self.max_new_tokens,
+                    q_visibility=q_visibility,
                 )
+
+            # On XLA, mark_step() flushes the lazy graph so it actually executes
+            # (same pattern as training's mark_step after each micro-batch).
+            if self.use_xla:
+                self._xm.mark_step()
 
             pred_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 

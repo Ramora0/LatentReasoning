@@ -117,7 +117,8 @@ class LatentReasoningModel(nn.Module):
             return outputs.last_hidden_state, outputs.past_key_values
         return outputs.last_hidden_state
 
-    def _build_question_masked_causal_mask(self, decode_mask_2d, q_len, answer_start, dtype, device):
+    def _build_question_masked_causal_mask(self, decode_mask_2d, q_len, answer_start, dtype, device,
+                                             q_visibility: float = 0.0):
         """Build 4D causal mask that hides question tokens from answer+marker positions.
 
         Args:
@@ -126,6 +127,7 @@ class LatentReasoningModel(nn.Module):
             answer_start: first row that cannot see questions (<answer> marker position)
             dtype: float dtype for the mask
             device: torch device
+            q_visibility: probability that each sample sees question tokens (0=all masked, 1=all visible)
         Returns:
             [B, 1, seq_len, seq_len] additive attention mask
         """
@@ -138,13 +140,22 @@ class LatentReasoningModel(nn.Module):
         padding_cols = decode_mask_2d.bool().unsqueeze(1).unsqueeze(1)  # [B, 1, 1, seq_len]
         mask = mask & padding_cols
         # Hide question columns for answer rows (answer_start onwards)
-        mask[:, :, answer_start:, :q_len] = False
+        if q_visibility >= 1.0:
+            pass  # all samples see question — skip masking
+        elif q_visibility <= 0.0:
+            mask[:, :, answer_start:, :q_len] = False  # all samples masked (current behavior)
+        else:
+            # Per-sample Bernoulli: each sample independently decides
+            unmask = torch.bernoulli(torch.full((B,), q_visibility, device=device)).bool()
+            # Mask question only for samples where unmask is False
+            mask_samples = ~unmask  # [B]
+            mask[mask_samples, :, answer_start:, :q_len] = False
         # Convert to additive: True -> 0.0, False -> finfo.min
         additive_mask = torch.where(mask, torch.tensor(0.0, dtype=dtype, device=device),
                                     torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=device))
         return additive_mask
 
-    def _build_inference_mask(self, mask_2d, q_len, dtype, device):
+    def _build_inference_mask(self, mask_2d, q_len, dtype, device, q_visibility: float = 0.0):
         """Build 4D mask for a single-token inference step with KV cache.
 
         Args:
@@ -152,11 +163,14 @@ class LatentReasoningModel(nn.Module):
             q_len: number of question positions to hide
             dtype: float dtype
             device: torch device
+            q_visibility: question visibility (deterministic at inference: >=0.5 means visible)
         Returns:
             [B, 1, 1, kv_len] additive attention mask
         """
         bool_mask = mask_2d.bool().clone()
-        bool_mask[:, :q_len] = False
+        if q_visibility < 0.5:
+            bool_mask[:, :q_len] = False
+        # else: leave question positions as-is (visible from padding mask)
         bool_mask = bool_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, kv_len]
         additive_mask = torch.where(bool_mask, torch.tensor(0.0, dtype=dtype, device=device),
                                     torch.tensor(torch.finfo(dtype).min, dtype=dtype, device=device))
@@ -433,6 +447,7 @@ class LatentReasoningModel(nn.Module):
         answer_ids: torch.Tensor,
         answer_mask: torch.Tensor,
         kv_cache=None,
+        q_visibility: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Phase 3: Teacher-forced answer decoding.
 
@@ -490,7 +505,8 @@ class LatentReasoningModel(nn.Module):
             q_len = self._thought_output_start + 1  # hide question tokens AND <thinking>
             answer_start = latent_states.shape[1] - 1  # <answer> marker position
             decode_mask_4d = self._build_question_masked_causal_mask(
-                decode_mask, q_len, answer_start, decode_input.dtype, decode_input.device
+                decode_mask, q_len, answer_start, decode_input.dtype, decode_input.device,
+                q_visibility=q_visibility,
             )
             hidden_out = self._run_transformer(decode_input, decode_mask_4d)
             prefix_len = latent_states.shape[1]
@@ -544,6 +560,7 @@ class LatentReasoningModel(nn.Module):
         thought_inputs: list = None,
         thought_output_start: int = None,
         K_for_stitching: int = None,
+        q_visibility: float = 0.0,
     ) -> dict:
         """Forward pass with optional phase splitting.
 
@@ -570,10 +587,12 @@ class LatentReasoningModel(nn.Module):
             return self._forward_decode(
                 latent_states, latent_mask, answer_ids, answer_mask,
                 thought_inputs, thought_output_start, K_for_stitching,
+                q_visibility=q_visibility,
             )
         else:
             return self._forward_all(
                 question_ids, question_mask, answer_ids, answer_mask, K, p,
+                q_visibility=q_visibility,
             )
 
     def _forward_generate(self, question_ids, question_mask, K, p):
@@ -620,7 +639,8 @@ class LatentReasoningModel(nn.Module):
         }
 
     def _forward_decode(self, latent_states, latent_mask, answer_ids, answer_mask,
-                        thought_inputs, thought_output_start, K_for_stitching):
+                        thought_inputs, thought_output_start, K_for_stitching,
+                        q_visibility: float = 0.0):
         """Phase 3 (decode) only, from pre-computed latent states.
 
         Splices fresh requires_grad thought_inputs into latent_states so
@@ -649,6 +669,7 @@ class LatentReasoningModel(nn.Module):
 
         loss, logits = self.phase3_decode(
             latent_states, latent_mask, answer_ids, answer_mask,
+            q_visibility=q_visibility,
         )
         print(f"[decode] {time.perf_counter()-t_start:.2f}s", flush=True)
 
@@ -717,7 +738,8 @@ class LatentReasoningModel(nn.Module):
         print(f"[forward_baseline] {time.perf_counter()-t_start:.2f}s", flush=True)
         return {"loss": loss, "logits": logits}
 
-    def _forward_all(self, question_ids, question_mask, answer_ids, answer_mask, K, p):
+    def _forward_all(self, question_ids, question_mask, answer_ids, answer_mask, K, p,
+                      q_visibility: float = 0.0):
         """Full forward pass: encode -> latent steps -> <answer> -> decode.
 
         Returns:
@@ -773,6 +795,7 @@ class LatentReasoningModel(nn.Module):
         # Phase 3: Decode — full sequence with gradient checkpointing (no KV cache).
         loss, logits = self.phase3_decode(
             hidden_states, extended_mask, answer_ids, answer_mask,
+            q_visibility=q_visibility,
         )
         print(f"[forward] {time.perf_counter()-t_start:.2f}s", flush=True)
 
@@ -797,6 +820,7 @@ class LatentReasoningModel(nn.Module):
         K: int,
         p: float,
         max_new_tokens: int = 64,
+        q_visibility: float = 1.0,
     ) -> torch.Tensor:
         """Inference: encode -> latent steps -> <answer> -> autoregressive greedy decoding.
 
@@ -848,7 +872,8 @@ class LatentReasoningModel(nn.Module):
         current_mask = extended_mask
         # Build 4D mask hiding question tokens for the <answer> position
         answer_mask_4d = self._build_inference_mask(
-            current_mask, q_len_orig, answer_marker.dtype, device
+            current_mask, q_len_orig, answer_marker.dtype, device,
+            q_visibility=q_visibility,
         )
         hidden_out, kv_cache = self._run_transformer(
             answer_marker, answer_mask_4d, past_key_values=kv_cache, use_cache=True
@@ -877,7 +902,8 @@ class LatentReasoningModel(nn.Module):
             )
             # Build 4D mask hiding question tokens for each autoregressive step
             step_mask_4d = self._build_inference_mask(
-                current_mask, q_len_orig, next_emb.dtype, device
+                current_mask, q_len_orig, next_emb.dtype, device,
+                q_visibility=q_visibility,
             )
             hidden_out, kv_cache = self._run_transformer(
                 next_emb, step_mask_4d, past_key_values=kv_cache, use_cache=True
