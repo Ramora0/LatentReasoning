@@ -5,7 +5,7 @@ model:
   name: "MCES10/maths-problems-gemma-2-2b-it"
 
 latent:
-  K: 64
+  K: 8
   stitching_depth: 8  # null = use K (exact gradients); set lower for faster training
   p_start: 0.0
   p_end: 0.0
