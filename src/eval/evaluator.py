@@ -81,16 +81,28 @@ class Evaluator:
             question = item[question_key]
             gold_text = item[answer_key]
 
-            # Tokenize question
+            # Tokenize question with left-padding to fixed length (matching
+            # training collator). Fixed shapes prevent XLA recompilation per
+            # example — the KV cache length at each autoregressive step becomes
+            # deterministic (fixed_q_len + step), so compiled graphs are reused.
+            max_q = self.config.data.max_question_tokens
             enc = self.tokenizer(
                 question,
                 truncation=True,
-                max_length=self.config.data.max_question_tokens,
+                max_length=max_q,
                 add_special_tokens=True,
                 return_tensors="pt",
             )
-            question_ids = enc["input_ids"].to(self.device)
-            question_mask = enc["attention_mask"].to(self.device)
+            ids = enc["input_ids"]        # [1, seq_len]
+            mask = enc["attention_mask"]   # [1, seq_len]
+            seq_len = ids.shape[1]
+            pad_len = max_q - seq_len
+            if pad_len > 0:
+                # Left-pad (same as training collator)
+                ids = torch.cat([torch.zeros(1, pad_len, dtype=ids.dtype), ids], dim=1)
+                mask = torch.cat([torch.zeros(1, pad_len, dtype=mask.dtype), mask], dim=1)
+            question_ids = ids.to(self.device)
+            question_mask = mask.to(self.device)
 
             # Generate answer
             with torch.no_grad():

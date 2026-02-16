@@ -49,6 +49,6 @@ logging:
   log_every_samples: 320
 
 checkpointing:
-  save_dir: "./checkpoints"
+  save_dir: "./checkpoints-question-annealed"
   save_every_samples: 32768
   keep_last_n: 3
