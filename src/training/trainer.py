@@ -310,7 +310,160 @@ class LatentReasoningTrainer:
         self._xm.optimizer_step(self.optimizer)
         self.scheduler.step()
 
+    # ---- Batch generation helpers ----
+
+    def _collect_micro_batches(self, epoch_loader_iter, count):
+        """Collect `count` micro-batches from the dataloader iterator.
+
+        Skips None batches. Returns list of batch dicts (already on device).
+        May return fewer than `count` if the iterator is exhausted.
+        """
+        batches = []
+        while len(batches) < count:
+            try:
+                batch = next(epoch_loader_iter)
+            except StopIteration:
+                break
+            if batch is None:
+                continue
+            if not self.use_xla:
+                batch = {k: v.to(self.device) for k, v in batch.items()}
+            batches.append(batch)
+        return batches
+
+    def _merge_batches(self, batches):
+        """Merge micro-batches into one big batch, re-padding to common lengths.
+
+        Questions are left-padded, so we add more left-padding to shorter ones.
+        Answers are right-padded, so we add more right-padding to shorter ones.
+
+        Returns:
+            (merged_batch, split_sizes): merged dict of tensors and list of
+            per-micro-batch batch sizes for splitting later.
+        """
+        split_sizes = [b["question_ids"].shape[0] for b in batches]
+
+        # Find max lengths across all micro-batches
+        max_q_len = max(b["question_ids"].shape[1] for b in batches)
+        max_a_len = max(b["answer_ids"].shape[1] for b in batches)
+
+        padded_q_ids = []
+        padded_q_mask = []
+        padded_a_ids = []
+        padded_a_mask = []
+
+        for b in batches:
+            q_ids = b["question_ids"]
+            q_mask = b["question_mask"]
+            a_ids = b["answer_ids"]
+            a_mask = b["answer_mask"]
+
+            # Left-pad questions
+            q_pad = max_q_len - q_ids.shape[1]
+            if q_pad > 0:
+                q_ids = torch.cat([torch.zeros(q_ids.shape[0], q_pad, dtype=q_ids.dtype, device=q_ids.device), q_ids], dim=1)
+                q_mask = torch.cat([torch.zeros(q_mask.shape[0], q_pad, dtype=q_mask.dtype, device=q_mask.device), q_mask], dim=1)
+
+            # Right-pad answers
+            a_pad = max_a_len - a_ids.shape[1]
+            if a_pad > 0:
+                a_ids = torch.cat([a_ids, torch.zeros(a_ids.shape[0], a_pad, dtype=a_ids.dtype, device=a_ids.device)], dim=1)
+                a_mask = torch.cat([a_mask, torch.zeros(a_mask.shape[0], a_pad, dtype=a_mask.dtype, device=a_mask.device)], dim=1)
+
+            padded_q_ids.append(q_ids)
+            padded_q_mask.append(q_mask)
+            padded_a_ids.append(a_ids)
+            padded_a_mask.append(a_mask)
+
+        merged = {
+            "question_ids": torch.cat(padded_q_ids, dim=0),
+            "question_mask": torch.cat(padded_q_mask, dim=0),
+            "answer_ids": torch.cat(padded_a_ids, dim=0),
+            "answer_mask": torch.cat(padded_a_mask, dim=0),
+        }
+        return merged, split_sizes
+
+    def _split_generate_outputs(self, gen_outputs, split_sizes):
+        """Split generate phase outputs back into micro-batch-sized chunks."""
+        latent_chunks = torch.split(gen_outputs["latent_states"], split_sizes, dim=0)
+        mask_chunks = torch.split(gen_outputs["latent_mask"], split_sizes, dim=0)
+
+        # Split thought_inputs: list of K tensors, each [big_B, 1, d_model]
+        thought_inputs = gen_outputs["thought_inputs"]
+        thought_input_chunks = []
+        if thought_inputs is not None:
+            for i, size in enumerate(split_sizes):
+                start = sum(split_sizes[:i])
+                chunk = [t[start:start + size] for t in thought_inputs]
+                thought_input_chunks.append(chunk)
+        else:
+            thought_input_chunks = [None] * len(split_sizes)
+
+        return latent_chunks, mask_chunks, thought_input_chunks
+
     # ---- Training loop ----
+
+    def _backward_and_stitch(self, outputs, p, accum_steps):
+        """Run backward pass with gradient stitching for one micro-batch.
+
+        Returns (stitch_debug dict, loss_value).
+        """
+        loss = outputs["loss"] / accum_steps
+        thought_inputs = outputs.get("thought_inputs")
+        thought_outputs = outputs.get("thought_outputs")
+        D = self.stitching_depth
+        stitch_debug = {}
+
+        if thought_inputs and thought_outputs and D > 0:
+            t_back = time.perf_counter()
+            loss.backward(retain_graph=True)
+            print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
+
+            decode_input = outputs.get("decode_input")
+            if decode_input is not None and decode_input.grad is not None:
+                t_gd = time.perf_counter()
+                grad = decode_input.grad
+                t_start, t_end = outputs["thought_positions"]
+                a_start = outputs["answer_positions"][0]
+                thought_grad = grad[:, t_start:t_end, :]
+                answer_grad = grad[:, a_start:, :]
+                stitch_debug["_thought_mean_t"] = thought_grad.norm(dim=-1).mean()
+                stitch_debug["_answer_mean_t"] = answer_grad.norm(dim=-1).mean()
+                stitch_debug["_thought_total_t"] = thought_grad.norm()
+                stitch_debug["_answer_total_t"] = answer_grad.norm()
+                print(f"[grad_decomp] {time.perf_counter()-t_gd:.2f}s", flush=True)
+
+            t_stitch = time.perf_counter()
+            for d in range(D):
+                t_d = time.perf_counter()
+                g = [t.grad.detach().clone() if t.grad is not None
+                     else torch.zeros_like(t) for t in thought_inputs]
+                for t in thought_inputs:
+                    t.grad = None
+                print(f"[stitch d={d}] grad extract {time.perf_counter()-t_d:.2f}s", flush=True)
+
+                if d == 0:
+                    g_sq_sum = sum(gk.norm().pow(2) for gk in g)
+                    stitch_debug["_thought_sensitivity_t"] = g_sq_sum.sqrt()
+
+                t_ls = time.perf_counter()
+                L_stitch = (1 - p) * sum(
+                    (g[k] * thought_outputs[k]).sum()
+                    for k in range(len(g))
+                )
+                print(f"[stitch d={d}] L_stitch compute {time.perf_counter()-t_ls:.2f}s", flush=True)
+
+                t_sb = time.perf_counter()
+                retain = (d < D - 1)
+                L_stitch.backward(retain_graph=retain)
+                print(f"[stitch d={d}] backward {time.perf_counter()-t_sb:.2f}s", flush=True)
+            print(f"[stitch] D={D} total {time.perf_counter()-t_stitch:.2f}s", flush=True)
+        else:
+            t_back = time.perf_counter()
+            loss.backward()
+            print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
+
+        return stitch_debug, loss
 
     def train(self):
         """Main training loop.
@@ -319,6 +472,10 @@ class LatentReasoningTrainer:
         (LR, p-annealing) and logging intervals are based on optimizer
         steps, which are deterministic given (dataset_size, batch_size,
         grad_accum, world_size, num_epochs).
+
+        When gradient_accumulation_steps > 1, Phase 1+2 (generation) runs on
+        the full accumulated batch for better GPU utilization, then Phase 3
+        (decode + backward + stitching) runs on each micro-batch sequentially.
         """
         self.model.train()
         max_steps = self.max_optimizer_steps
@@ -330,7 +487,13 @@ class LatentReasoningTrainer:
         log_loss = 0.0         # loss accumulated over logging window
         log_grad_norm = 0.0    # grad_norm accumulated over logging window
         log_steps = 0          # optimizer steps since last log
-        micro_step = 0  # counts forward passes within current accumulation window
+        # Gradient decomposition accumulators (averaged over logging window)
+        log_thought_mean = 0.0
+        log_answer_mean = 0.0
+        log_thought_total = 0.0
+        log_answer_total = 0.0
+        log_sensitivity = 0.0
+        log_grad_decomp_steps = 0  # may differ from log_steps if some steps lack grad info
         step_start_time = time.monotonic()
 
         pbar = tqdm(
@@ -353,250 +516,150 @@ class LatentReasoningTrainer:
             else:
                 epoch_loader = self.dataloader
 
-            for batch in epoch_loader:
-                # Skip empty batches (all samples discarded by length filter)
-                if batch is None:
-                    continue
-
-                # Move batch to device (MpDeviceLoader already does this for XLA)
-                if not self.use_xla:
-                    batch = {k: v.to(self.device) for k, v in batch.items()}
-
-                # Get curriculum values (based on optimizer steps for consistency)
-                K = self.K
-                p = self.curriculum.get_p(self.optimizer_step)
-
-                # Forward pass
-                with torch.autocast(
-                    device_type=self._autocast_device,
-                    dtype=torch.bfloat16,
-                    enabled=self.config.training.bf16,
-                ):
-                    outputs = self.model(
-                        question_ids=batch["question_ids"],
-                        question_mask=batch["question_mask"],
-                        answer_ids=batch["answer_ids"],
-                        answer_mask=batch["answer_mask"],
-                        K=K,
-                        p=p,
+            if self.grad_accum_steps > 1:
+                # Batched generation path: collect micro-batches, run Phase 1+2
+                # on the full batch, then split for Phase 3+backward+stitching
+                epoch_loader_iter = iter(epoch_loader)
+                while True:
+                    micro_batches = self._collect_micro_batches(
+                        epoch_loader_iter, self.grad_accum_steps
                     )
-                    loss = outputs["loss"] / self.grad_accum_steps
+                    if not micro_batches:
+                        break
 
-                # Backward with gradient stitching
-                thought_inputs = outputs.get("thought_inputs")
-                thought_outputs = outputs.get("thought_outputs")
-                D = self.stitching_depth
-                stitch_debug = {}
+                    K = self.K
+                    p = self.curriculum.get_p(self.optimizer_step)
+                    actual_accum = len(micro_batches)
 
-                if thought_inputs and thought_outputs and D > 0:
-                    # Initial backward: compute gradients for answer loss,
-                    # retain graph for stitching iterations
-                    t_back = time.perf_counter()
-                    loss.backward(retain_graph=True)
-                    print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
+                    # Merge micro-batches and run Phase 1+2 on big batch
+                    merged_batch, split_sizes = self._merge_batches(micro_batches)
 
-                    # Gradient decomposition: thought positions vs answer positions
-                    # NOTE: .item() calls force XLA graph execution (sync).
-                    # On XLA we keep everything as tensors and only call .item()
-                    # at logging time to avoid blocking the TPU pipeline.
-                    decode_input = outputs.get("decode_input")
-                    thought_mean_t = torch.tensor(0.0)
-                    answer_mean_t = torch.tensor(0.0)
-                    if decode_input is not None and decode_input.grad is not None:
-                        t_gd = time.perf_counter()
-                        grad = decode_input.grad
-                        t_start, t_end = outputs["thought_positions"]
-                        a_start = outputs["answer_positions"][0]
-                        thought_grad = grad[:, t_start:t_end, :]
-                        answer_grad = grad[:, a_start:, :]
-                        thought_mean_t = thought_grad.norm(dim=-1).mean()
-                        answer_mean_t = answer_grad.norm(dim=-1).mean()
-                        thought_total_t = thought_grad.norm()
-                        answer_total_t = answer_grad.norm()
-                        # Defer .item() — store tensors for now
-                        stitch_debug["_thought_mean_t"] = thought_mean_t
-                        stitch_debug["_answer_mean_t"] = answer_mean_t
-                        stitch_debug["_thought_total_t"] = thought_total_t
-                        stitch_debug["_answer_total_t"] = answer_total_t
-                        print(f"[grad_decomp] {time.perf_counter()-t_gd:.2f}s", flush=True)
+                    with torch.no_grad():
+                        with torch.autocast(
+                            device_type=self._autocast_device,
+                            dtype=torch.bfloat16,
+                            enabled=self.config.training.bf16,
+                        ):
+                            gen_outputs = self.model(
+                                question_ids=merged_batch["question_ids"],
+                                question_mask=merged_batch["question_mask"],
+                                K=K,
+                                p=p,
+                                phase="generate",
+                            )
 
-                    t_stitch = time.perf_counter()
-                    for d in range(D):
-                        t_d = time.perf_counter()
-                        # Extract gradients at thought input boundaries
-                        g = [t.grad.detach().clone() if t.grad is not None
-                             else torch.zeros_like(t) for t in thought_inputs]
-                        for t in thought_inputs:
-                            t.grad = None
-                        print(f"[stitch d={d}] grad extract {time.perf_counter()-t_d:.2f}s", flush=True)
+                    # Split outputs for micro-batch decode
+                    latent_chunks, mask_chunks, thought_input_chunks = \
+                        self._split_generate_outputs(gen_outputs, split_sizes)
 
-                        # On first iteration, store sensitivity tensor (no .item())
-                        if d == 0:
-                            g_sq_sum = sum(gk.norm().pow(2) for gk in g)
-                            stitch_debug["_thought_sensitivity_t"] = g_sq_sum.sqrt()
+                    # Split answer tensors back to micro-batch sizes
+                    answer_id_chunks = torch.split(merged_batch["answer_ids"], split_sizes, dim=0)
+                    answer_mask_chunks = torch.split(merged_batch["answer_mask"], split_sizes, dim=0)
 
-                        # Stitch: inject gradients into thought output positions.
-                        t_ls = time.perf_counter()
-                        L_stitch = (1 - p) * sum(
-                            (g[k] * thought_outputs[k]).sum()
-                            for k in range(len(g))
+                    thought_output_start = gen_outputs["thought_output_start"]
+
+                    # Phase 3 + backward + stitching for each micro-batch
+                    for i in range(actual_accum):
+                        # Re-create thought_inputs with requires_grad for this micro-batch
+                        micro_thought_inputs = None
+                        if thought_input_chunks[i] is not None:
+                            micro_thought_inputs = [
+                                t.detach().clone().requires_grad_(True)
+                                for t in thought_input_chunks[i]
+                            ]
+
+                        with torch.autocast(
+                            device_type=self._autocast_device,
+                            dtype=torch.bfloat16,
+                            enabled=self.config.training.bf16,
+                        ):
+                            outputs = self.model(
+                                answer_ids=answer_id_chunks[i],
+                                answer_mask=answer_mask_chunks[i],
+                                latent_states=latent_chunks[i],
+                                latent_mask=mask_chunks[i],
+                                thought_inputs=micro_thought_inputs,
+                                thought_output_start=thought_output_start,
+                                K_for_stitching=K,
+                                phase="decode",
+                            )
+
+                        stitch_debug, loss = self._backward_and_stitch(
+                            outputs, p, actual_accum
                         )
-                        print(f"[stitch d={d}] L_stitch compute {time.perf_counter()-t_ls:.2f}s", flush=True)
 
-                        t_sb = time.perf_counter()
-                        retain = (d < D - 1)
-                        L_stitch.backward(retain_graph=retain)
-                        print(f"[stitch d={d}] backward {time.perf_counter()-t_sb:.2f}s", flush=True)
-                    print(f"[stitch] D={D} total {time.perf_counter()-t_stitch:.2f}s", flush=True)
-                else:
-                    t_back = time.perf_counter()
-                    loss.backward()
-                    print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
-
-                self._stitch_debug = stitch_debug
-                self._last_thought_token_ids = outputs.get("thought_token_ids")
-                # loss.item() forces XLA sync — defer to logging time on XLA
-                if self.use_xla:
-                    accum_loss += loss.detach()  # keep on device
-                    # mark_step() flushes the traced graph to the TPU for execution.
-                    # Without this, the entire grad-accum window builds one giant
-                    # graph that only executes at the first .item() call (clip_grad),
-                    # causing a long stall and huge compilation time.
-                    t_ms = time.perf_counter()
-                    self._xm.mark_step()
-                    print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
-                else:
-                    accum_loss += loss.item()
-                micro_step += 1
-
-                # Optimizer step every grad_accum_steps micro-batches
-                if micro_step % self.grad_accum_steps == 0:
-                    # Gradient clipping
-                    t_clip = time.perf_counter()
-                    grad_norm = self._clip_grad_norm()
-                    print(f"[clip_grad] {time.perf_counter()-t_clip:.2f}s", flush=True)
-
-                    # Optimizer step (XLA needs mark_step which triggers graph execution)
-                    t_opt = time.perf_counter()
-                    if self.use_xla:
-                        print("[optim] calling xm.optimizer_step...", flush=True)
-                        self._xla_step()
-                        print(f"[optim] xla_step done {time.perf_counter()-t_opt:.2f}s", flush=True)
-                    else:
-                        self.optimizer.step()
-                        self.scheduler.step()
-                    t_zero = time.perf_counter()
-                    self.optimizer.zero_grad()
-                    print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
-                    self.optimizer_step += 1
-                    print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
-
-                    # Accumulate stats for logging window
-                    # On XLA, accum_loss is a device tensor — materialize here
-                    # (after mark_step so we don't stall mid-graph)
-                    t_sync = time.perf_counter()
-                    if self.use_xla:
-                        log_loss += accum_loss.item() if isinstance(accum_loss, torch.Tensor) else accum_loss
-                    else:
-                        log_loss += accum_loss
-                    print(f"[loss_sync] {time.perf_counter()-t_sync:.2f}s", flush=True)
-                    log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
-                    log_steps += 1
-                    accum_loss = 0.0
-
-                    # Logging (based on optimizer steps)
-                    if self.is_main and self.optimizer_step % log_every == 0:
-                        t_log = time.perf_counter()
-                        avg_loss = log_loss / log_steps
-                        avg_grad_norm = log_grad_norm / log_steps
-                        step_time = time.monotonic() - step_start_time
-                        samples_per_sec = (
-                            log_steps * self.grad_accum_steps
-                            * self.config.training.batch_size_per_gpu
-                            * self.world_size / step_time
-                        )
-                        lrs = self.scheduler.get_last_lr()
-                        log_dict = {
-                            "train/loss": avg_loss,
-                            "train/perplexity": math.exp(min(avg_loss, 20)),
-                            "train/grad_norm": avg_grad_norm,
-                            "train/lr": lrs[0],
-                            "train/epoch": epoch,
-                            "train/samples_per_sec": samples_per_sec,
-                            "curriculum/K": K,
-                            "curriculum/p": p,
-                            "data/question_discard_rate": self.train_dataset.discard_rate,
-                        }
-                        log_dict["stitching/depth"] = self.stitching_depth
-                        # Materialize deferred stitch debug tensors for logging
-                        if hasattr(self, '_stitch_debug'):
-                            sd = self._stitch_debug
-                            if "_thought_mean_t" in sd:
-                                thought_mean = sd["_thought_mean_t"].item()
-                                answer_mean = sd["_answer_mean_t"].item()
-                                thought_total = sd["_thought_total_t"].item()
-                                answer_total = sd["_answer_total_t"].item()
-                                log_dict["grad/thought_mean_norm"] = thought_mean
-                                log_dict["grad/answer_mean_norm"] = answer_mean
-                                denom_mean = thought_mean + answer_mean
-                                if denom_mean > 0:
-                                    log_dict["grad/thought_pct_per_pos"] = thought_mean / denom_mean
-                                denom_total = thought_total + answer_total
-                                if denom_total > 0:
-                                    log_dict["grad/thought_pct_total"] = thought_total / denom_total
-                            if "_thought_sensitivity_t" in sd:
-                                sensitivity = sd["_thought_sensitivity_t"].item()
-                                log_dict["thought_sensitivity"] = sensitivity
-                                if answer_mean > 0 and K > 0:
-                                    log_dict["grad/thought_sensitivity_vs_answer"] = (
-                                        sensitivity / (answer_mean * K)
-                                    )
                         if self.use_xla:
-                            import torch_xla.debug.metrics as met
-                            compile_data = met.metric_data('CompileTime')
-                            if compile_data:
-                                log_dict["xla/compile_count"] = compile_data[1]
-                                log_dict["xla/compile_time_s"] = compile_data[0] / 1e9
-                                print(f"  [XLA] compilations={compile_data[1]}, "
-                                      f"compile_time={compile_data[0]/1e9:.1f}s")
-                        if torch.cuda.is_available():
-                            log_dict["system/gpu_memory_allocated_gb"] = (
-                                torch.cuda.max_memory_allocated(self.device) / 1e9
-                            )
-                            log_dict["system/gpu_memory_reserved_gb"] = (
-                                torch.cuda.max_memory_reserved(self.device) / 1e9
-                            )
-                            torch.cuda.reset_peak_memory_stats(self.device)
-                        if wandb is not None and wandb.run is not None:
-                            wandb.log(log_dict, step=self.optimizer_step)
-                        pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
-                        print(f"[logging] {time.perf_counter()-t_log:.2f}s", flush=True)
+                            accum_loss += loss.detach()
+                            t_ms = time.perf_counter()
+                            self._xm.mark_step()
+                            print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
+                        else:
+                            accum_loss += loss.item()
 
-                        # Print sample thought tokens from first example in last batch
-                        if self.tokenizer is not None and self._last_thought_token_ids is not None:
-                            try:
-                                thought_toks = self.tokenizer.decode(
-                                    self._last_thought_token_ids[0], skip_special_tokens=False
-                                )
-                                print(f"\n  [sample] thoughts: {thought_toks[:200]}")
-                            except Exception as e:
-                                print(f"\n  [sample] decode error: {e}")
+                    self._stitch_debug = stitch_debug
+                    self._last_thought_token_ids = gen_outputs.get("thought_token_ids")
 
-                        log_loss = 0.0
-                        log_grad_norm = 0.0
-                        log_steps = 0
-                        step_start_time = time.monotonic()
+                    # Optimizer step
+                    accum_loss, log_loss, log_grad_norm, log_steps, \
+                        log_thought_mean, log_answer_mean, log_thought_total, \
+                        log_answer_total, log_sensitivity, log_grad_decomp_steps, \
+                        step_start_time = self._do_optimizer_step(
+                            accum_loss, log_loss, log_grad_norm, log_steps,
+                            log_thought_mean, log_answer_mean, log_thought_total,
+                            log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                            step_start_time, K, p, epoch, pbar,
+                            max_steps, log_every, eval_every, save_every,
+                        )
 
-                    # Evaluation
-                    if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
-                        self._run_eval(K, p)
-                        self.model.train()
+            else:
+                # Single micro-batch path (grad_accum_steps == 1): use phase="all"
+                for batch in epoch_loader:
+                    if batch is None:
+                        continue
 
-                    # Checkpointing
-                    if self.optimizer_step % save_every == 0:
-                        self._save_checkpoint()
+                    if not self.use_xla:
+                        batch = {k: v.to(self.device) for k, v in batch.items()}
 
-                    pbar.update(1)
+                    K = self.K
+                    p = self.curriculum.get_p(self.optimizer_step)
+
+                    with torch.autocast(
+                        device_type=self._autocast_device,
+                        dtype=torch.bfloat16,
+                        enabled=self.config.training.bf16,
+                    ):
+                        outputs = self.model(
+                            question_ids=batch["question_ids"],
+                            question_mask=batch["question_mask"],
+                            answer_ids=batch["answer_ids"],
+                            answer_mask=batch["answer_mask"],
+                            K=K,
+                            p=p,
+                        )
+
+                    stitch_debug, loss = self._backward_and_stitch(outputs, p, 1)
+
+                    self._stitch_debug = stitch_debug
+                    self._last_thought_token_ids = outputs.get("thought_token_ids")
+                    if self.use_xla:
+                        accum_loss += loss.detach()
+                        t_ms = time.perf_counter()
+                        self._xm.mark_step()
+                        print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
+                    else:
+                        accum_loss += loss.item()
+
+                    # Optimizer step (always, since grad_accum_steps == 1)
+                    accum_loss, log_loss, log_grad_norm, log_steps, \
+                        log_thought_mean, log_answer_mean, log_thought_total, \
+                        log_answer_total, log_sensitivity, log_grad_decomp_steps, \
+                        step_start_time = self._do_optimizer_step(
+                            accum_loss, log_loss, log_grad_norm, log_steps,
+                            log_thought_mean, log_answer_mean, log_thought_total,
+                            log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                            step_start_time, K, p, epoch, pbar,
+                            max_steps, log_every, eval_every, save_every,
+                        )
 
             if self.is_main:
                 print(f"\nEpoch {epoch + 1}/{self.num_epochs} complete "
@@ -609,6 +672,157 @@ class LatentReasoningTrainer:
 
         if self.is_main and wandb is not None and wandb.run is not None:
             wandb.finish()
+
+    def _do_optimizer_step(self, accum_loss, log_loss, log_grad_norm, log_steps,
+                           log_thought_mean, log_answer_mean, log_thought_total,
+                           log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                           step_start_time, K, p, epoch, pbar,
+                           max_steps, log_every, eval_every, save_every):
+        """Execute optimizer step, logging, eval, and checkpoint. Returns updated accumulators."""
+        # Gradient clipping
+        t_clip = time.perf_counter()
+        grad_norm = self._clip_grad_norm()
+        print(f"[clip_grad] {time.perf_counter()-t_clip:.2f}s", flush=True)
+
+        # Optimizer step (XLA needs mark_step which triggers graph execution)
+        t_opt = time.perf_counter()
+        if self.use_xla:
+            print("[optim] calling xm.optimizer_step...", flush=True)
+            self._xla_step()
+            print(f"[optim] xla_step done {time.perf_counter()-t_opt:.2f}s", flush=True)
+        else:
+            self.optimizer.step()
+            self.scheduler.step()
+        t_zero = time.perf_counter()
+        self.optimizer.zero_grad()
+        print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
+        self.optimizer_step += 1
+        print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
+
+        # Accumulate stats for logging window
+        t_sync = time.perf_counter()
+        if self.use_xla:
+            log_loss += accum_loss.item() if isinstance(accum_loss, torch.Tensor) else accum_loss
+        else:
+            log_loss += accum_loss
+        print(f"[loss_sync] {time.perf_counter()-t_sync:.2f}s", flush=True)
+        log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+        log_steps += 1
+        accum_loss = 0.0
+
+        # Accumulate gradient decomposition stats
+        if hasattr(self, '_stitch_debug') and self._stitch_debug:
+            sd = self._stitch_debug
+            if "_thought_mean_t" in sd:
+                log_thought_mean += sd["_thought_mean_t"].item()
+                log_answer_mean += sd["_answer_mean_t"].item()
+                log_thought_total += sd["_thought_total_t"].item()
+                log_answer_total += sd["_answer_total_t"].item()
+            if "_thought_sensitivity_t" in sd:
+                log_sensitivity += sd["_thought_sensitivity_t"].item()
+            log_grad_decomp_steps += 1
+
+        # Logging (based on optimizer steps)
+        if self.is_main and self.optimizer_step % log_every == 0:
+            t_log = time.perf_counter()
+            avg_loss = log_loss / log_steps
+            avg_grad_norm = log_grad_norm / log_steps
+            step_time = time.monotonic() - step_start_time
+            samples_per_sec = (
+                log_steps * self.grad_accum_steps
+                * self.config.training.batch_size_per_gpu
+                * self.world_size / step_time
+            )
+            lrs = self.scheduler.get_last_lr()
+            log_dict = {
+                "train/loss": avg_loss,
+                "train/perplexity": math.exp(min(avg_loss, 20)),
+                "train/grad_norm": avg_grad_norm,
+                "train/lr": lrs[0],
+                "train/epoch": epoch,
+                "train/samples_per_sec": samples_per_sec,
+                "curriculum/K": K,
+                "curriculum/p": p,
+                "data/question_discard_rate": self.train_dataset.discard_rate,
+            }
+            log_dict["stitching/depth"] = self.stitching_depth
+            # Log averaged gradient decomposition metrics
+            if log_grad_decomp_steps > 0:
+                thought_mean = log_thought_mean / log_grad_decomp_steps
+                answer_mean = log_answer_mean / log_grad_decomp_steps
+                thought_total = log_thought_total / log_grad_decomp_steps
+                answer_total = log_answer_total / log_grad_decomp_steps
+                log_dict["grad/thought_mean_norm"] = thought_mean
+                log_dict["grad/answer_mean_norm"] = answer_mean
+                denom_mean = thought_mean + answer_mean
+                if denom_mean > 0:
+                    log_dict["grad/thought_pct_per_pos"] = thought_mean / denom_mean
+                denom_total = thought_total + answer_total
+                if denom_total > 0:
+                    log_dict["grad/thought_pct_total"] = thought_total / denom_total
+                sensitivity = log_sensitivity / log_grad_decomp_steps
+                log_dict["thought_sensitivity"] = sensitivity
+                if answer_mean > 0 and K > 0:
+                    log_dict["grad/thought_sensitivity_vs_answer"] = (
+                        sensitivity / (answer_mean * K)
+                    )
+            if self.use_xla:
+                import torch_xla.debug.metrics as met
+                compile_data = met.metric_data('CompileTime')
+                if compile_data:
+                    log_dict["xla/compile_count"] = compile_data[1]
+                    log_dict["xla/compile_time_s"] = compile_data[0] / 1e9
+                    print(f"  [XLA] compilations={compile_data[1]}, "
+                          f"compile_time={compile_data[0]/1e9:.1f}s")
+            if torch.cuda.is_available():
+                log_dict["system/gpu_memory_allocated_gb"] = (
+                    torch.cuda.max_memory_allocated(self.device) / 1e9
+                )
+                log_dict["system/gpu_memory_reserved_gb"] = (
+                    torch.cuda.max_memory_reserved(self.device) / 1e9
+                )
+                torch.cuda.reset_peak_memory_stats(self.device)
+            if wandb is not None and wandb.run is not None:
+                wandb.log(log_dict, step=self.optimizer_step)
+            pbar.set_postfix(loss=f"{avg_loss:.4f}", K=K, p=f"{p:.3f}", epoch=epoch)
+            print(f"[logging] {time.perf_counter()-t_log:.2f}s", flush=True)
+
+            # Print sample thought tokens from first example in last batch
+            if self.tokenizer is not None and self._last_thought_token_ids is not None:
+                try:
+                    thought_toks = self.tokenizer.decode(
+                        self._last_thought_token_ids[0], skip_special_tokens=False
+                    )
+                    print(f"\n  [sample] thoughts: {thought_toks[:200]}")
+                except Exception as e:
+                    print(f"\n  [sample] decode error: {e}")
+
+            log_loss = 0.0
+            log_grad_norm = 0.0
+            log_steps = 0
+            log_thought_mean = 0.0
+            log_answer_mean = 0.0
+            log_thought_total = 0.0
+            log_answer_total = 0.0
+            log_sensitivity = 0.0
+            log_grad_decomp_steps = 0
+            step_start_time = time.monotonic()
+
+        # Evaluation
+        if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
+            self._run_eval(K, p)
+            self.model.train()
+
+        # Checkpointing
+        if self.optimizer_step % save_every == 0:
+            self._save_checkpoint()
+
+        pbar.update(1)
+
+        return (accum_loss, log_loss, log_grad_norm, log_steps,
+                log_thought_mean, log_answer_mean, log_thought_total,
+                log_answer_total, log_sensitivity, log_grad_decomp_steps,
+                step_start_time)
 
     def _run_eval(self, K, p):
         """Run evaluation on configured benchmarks."""

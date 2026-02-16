@@ -455,13 +455,129 @@ class LatentReasoningModel(nn.Module):
 
     def forward(
         self,
-        question_ids: torch.Tensor,
-        question_mask: torch.Tensor,
-        answer_ids: torch.Tensor,
-        answer_mask: torch.Tensor,
-        K: int,
-        p: float,
+        question_ids: torch.Tensor = None,
+        question_mask: torch.Tensor = None,
+        answer_ids: torch.Tensor = None,
+        answer_mask: torch.Tensor = None,
+        K: int = 0,
+        p: float = 0.0,
+        phase: str = "all",
+        latent_states: torch.Tensor = None,
+        latent_mask: torch.Tensor = None,
+        thought_inputs: list = None,
+        thought_output_start: int = None,
+        K_for_stitching: int = None,
     ) -> dict:
+        """Forward pass with optional phase splitting.
+
+        Args:
+            phase: "all" (default) runs full pipeline. "generate" runs Phase 1+2
+                only (no grad needed). "decode" runs Phase 3 only from provided
+                latent states.
+
+        For phase="generate", requires: question_ids, question_mask, K, p.
+        Returns dict with 'latent_states', 'latent_mask', 'thought_inputs',
+        'thought_output_start', 'K', 'thought_token_ids'.
+
+        For phase="decode", requires: latent_states, latent_mask, answer_ids,
+        answer_mask, thought_inputs, thought_output_start, K_for_stitching.
+        Returns same dict as phase="all".
+
+        For phase="all" (default), requires: question_ids, question_mask,
+        answer_ids, answer_mask, K, p. Returns dict with 'loss', 'logits',
+        and training tensors.
+        """
+        if phase == "generate":
+            return self._forward_generate(question_ids, question_mask, K, p)
+        elif phase == "decode":
+            return self._forward_decode(
+                latent_states, latent_mask, answer_ids, answer_mask,
+                thought_inputs, thought_output_start, K_for_stitching,
+            )
+        else:
+            return self._forward_all(
+                question_ids, question_mask, answer_ids, answer_mask, K, p,
+            )
+
+    def _forward_generate(self, question_ids, question_mask, K, p):
+        """Phase 1 (encode) + Phase 2 (latent steps). No grad needed."""
+        t_start = time.perf_counter()
+        hidden_states = self.phase1_encode(question_ids)
+        q_len_orig = hidden_states.shape[1]
+
+        B = hidden_states.shape[0]
+        device = hidden_states.device
+        thinking_marker = self.thinking_token_emb.expand(B, -1, -1)
+        hidden_states = torch.cat([hidden_states, thinking_marker], dim=1)
+        question_mask = torch.cat(
+            [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
+            dim=1,
+        )
+
+        self._thought_output_start = q_len_orig
+        self._K_for_stitching = K
+
+        hidden_states, extended_mask, _ = self.phase2_latent_steps(
+            hidden_states, question_mask, K, p
+        )
+
+        # Insert <answer> token
+        answer_marker = self.answer_token_emb.expand(B, -1, -1)
+        hidden_states = torch.cat([hidden_states, answer_marker], dim=1)
+        extended_mask = torch.cat(
+            [extended_mask, torch.ones(B, 1, dtype=extended_mask.dtype, device=device)],
+            dim=1,
+        )
+        print(f"[generate] {time.perf_counter()-t_start:.2f}s", flush=True)
+
+        return {
+            "latent_states": hidden_states,
+            "latent_mask": extended_mask,
+            "thought_inputs": getattr(self, '_thought_inputs', None),
+            "thought_output_start": q_len_orig,
+            "K": K,
+            "thought_token_ids": getattr(self, '_thought_token_ids', None),
+        }
+
+    def _forward_decode(self, latent_states, latent_mask, answer_ids, answer_mask,
+                        thought_inputs, thought_output_start, K_for_stitching):
+        """Phase 3 (decode) only, from pre-computed latent states.
+
+        Splices fresh requires_grad thought_inputs into latent_states so
+        gradients can flow to the thought positions during backward.
+        """
+        t_start = time.perf_counter()
+        # Set instance state needed by phase3_decode
+        self._thought_output_start = thought_output_start
+        self._K_for_stitching = K_for_stitching
+        self._thought_inputs = thought_inputs
+
+        # Splice fresh thought_inputs (with requires_grad=True) into latent_states.
+        # Layout: [q_tokens, <thinking>, t_0..t_{K-1}, <answer>]
+        # Thought positions: thought_output_start+1 .. thought_output_start+K
+        if thought_inputs is not None:
+            t_start_pos = thought_output_start + 1
+            t_end_pos = t_start_pos + K_for_stitching
+            prefix = latent_states[:, :t_start_pos, :]
+            suffix = latent_states[:, t_end_pos:, :]
+            thoughts = torch.cat(thought_inputs, dim=1)  # [B, K, d_model]
+            latent_states = torch.cat([prefix, thoughts, suffix], dim=1)
+
+        loss, logits = self.phase3_decode(
+            latent_states, latent_mask, answer_ids, answer_mask,
+        )
+        print(f"[decode] {time.perf_counter()-t_start:.2f}s", flush=True)
+
+        result = {"loss": loss, "logits": logits}
+        if self.training:
+            result["thought_inputs"] = thought_inputs
+            result["thought_outputs"] = getattr(self, '_thought_outputs', None)
+            result["decode_input"] = getattr(self, '_decode_input', None)
+            result["thought_positions"] = (thought_output_start, thought_output_start + K_for_stitching)
+            result["answer_positions"] = (latent_states.shape[1], None)
+        return result
+
+    def _forward_all(self, question_ids, question_mask, answer_ids, answer_mask, K, p):
         """Full forward pass: encode -> latent steps -> <answer> -> decode.
 
         Returns:

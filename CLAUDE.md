@@ -36,7 +36,6 @@ python scripts/evaluate.py --config configs/base.yaml --checkpoint checkpoints/s
 # Tests
 pytest tests/                    # all tests (GPU tests skip if no CUDA)
 pytest tests/test_model.py -k "TestCurriculumScheduler"  # curriculum tests (no GPU needed)
-pytest tests/test_model.py -k "TestCurriculumScheduler"  # curriculum tests (no GPU needed)
 pytest tests/test_model.py -k "TestLatentReasoningModel"  # full model tests (needs GPU)
 ```
 
@@ -71,7 +70,7 @@ Instead of backpropagating through K sequential transformer calls, gradient stit
 
 ### Curriculum (`src/training/curriculum.py`)
 
-K (number of latent iterations) is fixed at 8 for all training (set via `latent.K` in config). The only schedule is **p annealing**: linearly interpolates from p_start (0.9) → p_end (0.0) over `p_anneal_ratio` (default 0.8) of total optimizer steps. At p=0.9 the model operates near-standard autoregressive generation; at p=0.0 it appends continuous "thought vectors."
+K (number of latent iterations) is fixed at 8 for all training (set via `latent.K` in config). The curriculum supports **p annealing**: linearly interpolates from `p_start` → `p_end` over `p_anneal_ratio` (default 0.8) of total optimizer steps. Current config sets `p_start: 0.0` and `p_end: 0.0` (pure latent mode from the start, no annealing). To use annealing, set e.g. `p_start: 0.9` to start near-standard autoregressive generation and anneal to continuous thought vectors.
 
 ### Key Design Detail: Gemma 2 Normalizer
 
@@ -86,20 +85,20 @@ Questions are left-padded in the collator (`src/data/collator.py`). HuggingFace 
 - `src/model/` — Model definition (`LatentReasoningModel`)
 - `src/training/` — Trainer (FSDP for both CUDA and XLA/TPU) and curriculum scheduler
 - `src/data/` — `BigMathDataset` (loads `SynthLabsAI/Big-Math-RL-Verified`) and collator (pads question/answer independently)
-- `src/eval/` — Evaluator (GSM8K, MATH benchmarks) and answer extraction/comparison metrics
-- `scripts/` — Entry points for training and evaluation
+- `src/eval/` — Evaluator (GSM8K benchmark) and answer extraction/comparison metrics
+- `scripts/` — Entry points for training, evaluation, model/data download (`download.py`), and TPU utilization monitoring (`tpu_utilization.py`)
 - `configs/base.yaml` — Default config (OmegaConf); all settings controlled here
 - `plan.md` — Full design document with rationale, risks, and implementation plan
 
 ## Config
 
-All configuration is via OmegaConf YAML (`configs/base.yaml`) with CLI dotlist overrides. Key sections: `model`, `latent` (K/p schedules/stitching_depth), `training`, `distributed` (backend: "cuda" or "xla", FSDP settings), `data`, `eval`, `logging`, `checkpointing`.
+All configuration is via OmegaConf YAML (`configs/base.yaml`) with CLI dotlist overrides. Key sections: `paths` (scratch_dir for cluster storage), `model`, `latent` (K/p schedules/stitching_depth), `training`, `distributed` (backend: "cuda" or "xla", FSDP settings), `data`, `eval`, `logging`, `checkpointing`.
 
 ## Backend Support
 
 The trainer and model support both CUDA/NCCL and XLA/TPU backends. Backend is selected via `distributed.backend` in config. Key differences:
 - XLA uses `eager` attention implementation; CUDA uses `sdpa`
-- XLA uses `XlaFullyShardedDataParallel`; CUDA uses `torch.distributed.fsdp`
+- XLA skips FSDP (Gemma 2 2B fits per chip; `xm.optimizer_step` handles gradient all-reduce); CUDA uses `torch.distributed.fsdp`
 - XLA uses `MpDeviceLoader` for async host-to-device transfer
 - XLA checkpointing uses `xm.save`
 
