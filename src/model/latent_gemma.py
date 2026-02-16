@@ -578,6 +578,9 @@ class LatentReasoningModel(nn.Module):
 
     def _forward_generate(self, question_ids, question_mask, K, p):
         """Phase 1 (encode) + Phase 2 (latent steps). No grad needed."""
+        if self.use_xla:
+            print(f"  [shapes:gen] q={list(question_ids.shape)} q_mask={list(question_mask.shape)} "
+                  f"K={K} p={p}", flush=True)
         t_start = time.perf_counter()
         hidden_states = self.phase1_encode(question_ids)
         q_len_orig = hidden_states.shape[1]
@@ -623,6 +626,10 @@ class LatentReasoningModel(nn.Module):
         Splices fresh requires_grad thought_inputs into latent_states so
         gradients can flow to the thought positions during backward.
         """
+        if self.use_xla:
+            print(f"  [shapes:dec] latent={list(latent_states.shape)} "
+                  f"a={list(answer_ids.shape)} a_mask={list(answer_mask.shape)} "
+                  f"t_out_start={thought_output_start} K={K_for_stitching}", flush=True)
         t_start = time.perf_counter()
         # Set instance state needed by phase3_decode
         self._thought_output_start = thought_output_start
@@ -662,6 +669,10 @@ class LatentReasoningModel(nn.Module):
             'thought_inputs' (list of K leaf tensors with requires_grad=True)
             'thought_outputs' (list of K tensors live in the computation graph)
         """
+        if self.use_xla:
+            print(f"  [shapes] q={list(question_ids.shape)} q_mask={list(question_mask.shape)} "
+                  f"a={list(answer_ids.shape)} a_mask={list(answer_mask.shape)} K={K} p={p}",
+                  flush=True)
         # Phase 1: Encode
         t_start = time.perf_counter()
         hidden_states = self.phase1_encode(question_ids)
