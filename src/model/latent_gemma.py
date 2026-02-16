@@ -805,6 +805,12 @@ class LatentReasoningModel(nn.Module):
         if isinstance(eos_id, list):
             eos_id = eos_id[0]
 
+        # Baseline mode: K=0 means no latent steps, no question masking
+        if K == 0:
+            return self._generate_answer_baseline(
+                question_ids, question_mask, max_new_tokens, eos_id
+            )
+
         # Phase 1: Encode
         hidden_states = self.phase1_encode(question_ids)
         q_len_orig = hidden_states.shape[1] + 1  # question + <thinking> positions to mask from answers
@@ -876,4 +882,59 @@ class LatentReasoningModel(nn.Module):
 
         if generated:
             return torch.cat(generated, dim=1)  # [B, num_generated]
+        return torch.zeros(B, 0, dtype=torch.long, device=device)
+
+    @torch.no_grad()
+    def _generate_answer_baseline(self, question_ids, question_mask, max_new_tokens, eos_id):
+        """Baseline inference: encode question, then autoregressive greedy decode.
+
+        No latent steps, no <thinking>/<answer> markers, no question masking.
+        """
+        B = question_ids.shape[0]
+        device = question_ids.device
+
+        # Encode question and build KV cache
+        hidden_states = self.phase1_encode(question_ids)
+        hidden_out, kv_cache = self._run_transformer(
+            hidden_states, question_mask, use_cache=True
+        )
+
+        # First token from last question position
+        last_hidden = hidden_out[:, -1:, :]
+        logits = self.lm_head(last_hidden)
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            logits = cap * torch.tanh(logits / cap)
+
+        next_token = logits.argmax(dim=-1)  # [B, 1]
+        generated = [next_token]
+        current_mask = torch.cat(
+            [question_mask, torch.ones(B, 1, dtype=question_mask.dtype, device=device)],
+            dim=1,
+        )
+
+        for step in range(1, max_new_tokens):
+            if eos_id is not None and (next_token == eos_id).all():
+                break
+
+            next_emb = self.embed_tokens(next_token) * self.normalizer
+            current_mask = torch.cat(
+                [current_mask, torch.ones(B, 1, dtype=current_mask.dtype, device=device)],
+                dim=1,
+            )
+            hidden_out, kv_cache = self._run_transformer(
+                next_emb, current_mask, past_key_values=kv_cache, use_cache=True
+            )
+
+            last_hidden = hidden_out[:, -1:, :]
+            logits = self.lm_head(last_hidden)
+            if self.final_logit_softcapping is not None:
+                cap = self.final_logit_softcapping
+                logits = cap * torch.tanh(logits / cap)
+
+            next_token = logits.argmax(dim=-1)
+            generated.append(next_token)
+
+        if generated:
+            return torch.cat(generated, dim=1)
         return torch.zeros(B, 0, dtype=torch.long, device=device)
