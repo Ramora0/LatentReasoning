@@ -448,7 +448,7 @@ class LatentReasoningTrainer:
                 L_stitch = (1 - p) * sum(
                     (g[k] * thought_outputs[k]).sum()
                     for k in range(len(g))
-                ) / len(g)
+                )
 
                 t_sb = time.perf_counter()
                 retain = (d < D - 1)

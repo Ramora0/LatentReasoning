@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, StaticCache
 
 class LatentReasoningModel(nn.Module):
     """Three-phase latent reasoning model built on Gemma 2 2B.
@@ -92,7 +92,7 @@ class LatentReasoningModel(nn.Module):
         return self.base_model.model
 
     def _run_transformer(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor,
-                         past_key_values=None, use_cache=False):
+                         past_key_values=None, use_cache=False, cache_position=None):
         """Run inputs through the transformer, pre-dividing by normalizer.
 
         Gemma 2 internally multiplies inputs_embeds by sqrt(d_model). By pre-dividing,
@@ -111,6 +111,7 @@ class LatentReasoningModel(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            cache_position=cache_position,
         )
         if use_cache:
             return outputs.last_hidden_state, outputs.past_key_values
@@ -183,6 +184,9 @@ class LatentReasoningModel(nn.Module):
         Returns:
             list of K tensors, each [B, 1, d_model]
         """
+        if self.use_xla:
+            return self._generate_thoughts_xla(hidden_states, attention_mask, K, p)
+
         B = hidden_states.shape[0]
         device = hidden_states.device
         thoughts = []
@@ -225,6 +229,79 @@ class LatentReasoningModel(nn.Module):
                 [attention_mask, torch.ones(B, 1, dtype=attention_mask.dtype, device=device)],
                 dim=1,
             )
+
+        self._thought_token_ids = torch.stack(thought_token_ids, dim=1)  # [B, K]
+        return thoughts
+
+    @torch.no_grad()
+    def _generate_thoughts_xla(self, hidden_states, attention_mask, K, p):
+        """Generate K thought vectors on XLA with fixed tensor shapes.
+
+        Uses StaticCache and a pre-padded attention mask so that all K
+        iterations operate on identically-shaped tensors.  This lets XLA
+        compile the full K-step loop as a single graph (one compilation)
+        instead of recompiling per iteration due to growing DynamicCache
+        and attention_mask shapes.
+        """
+        B = hidden_states.shape[0]
+        device = hidden_states.device
+        thoughts = []
+        thought_token_ids = []
+
+        seq_len = hidden_states.shape[1]   # q_len + 1 (<thinking> token)
+        max_cache_len = seq_len + K
+
+        # Pre-allocate static KV cache — fixed size eliminates recompilation.
+        # StaticCache is safe for Gemma 2 here because our sequences are
+        # always << sliding_window, so global-only attention is equivalent.
+        kv_cache = StaticCache(
+            config=self.base_model.config,
+            max_batch_size=B,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=hidden_states.dtype,
+        )
+
+        # Pre-pad attention mask to final size (shape never changes)
+        mask = torch.zeros(B, max_cache_len, dtype=attention_mask.dtype, device=device)
+        mask[:, :seq_len] = attention_mask
+
+        # Step 0: full pass to populate cache
+        cache_pos = torch.arange(seq_len, device=device)
+        hidden_out, kv_cache = self._run_transformer(
+            hidden_states, mask, past_key_values=kv_cache, use_cache=True,
+            cache_position=cache_pos,
+        )
+        last_hidden = hidden_out[:, -1:, :]
+        del hidden_out
+
+        logits = self.lm_head(last_hidden)
+        token_ids = logits.argmax(dim=-1)
+        thought_token_ids.append(token_ids[:, 0])  # [B]
+        token_emb = self.embed_tokens(token_ids) * self.normalizer
+        blended = token_emb * p + last_hidden * (1 - p)
+        thoughts.append(blended)
+
+        # Steps 1..K-1: single-token passes — all share shape [B, 1, d_model]
+        # input, [B, max_cache_len] mask, and [1] cache_position.
+        for k in range(1, K):
+            # Unmask the position for the thought we're about to process
+            pos = seq_len + k - 1
+            mask[:, pos] = 1
+            cache_pos_k = torch.tensor([pos], device=device)
+
+            hidden_out, kv_cache = self._run_transformer(
+                blended, mask, past_key_values=kv_cache, use_cache=True,
+                cache_position=cache_pos_k,
+            )
+            last_hidden = hidden_out[:, -1:, :]
+
+            logits = self.lm_head(last_hidden)
+            token_ids = logits.argmax(dim=-1)
+            thought_token_ids.append(token_ids[:, 0])  # [B]
+            token_emb = self.embed_tokens(token_ids) * self.normalizer
+            blended = token_emb * p + last_hidden * (1 - p)
+            thoughts.append(blended)
 
         self._thought_token_ids = torch.stack(thought_token_ids, dim=1)  # [B, K]
         return thoughts
