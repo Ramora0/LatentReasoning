@@ -13,7 +13,7 @@ latent:
 
 training:
   batch_size_per_gpu: 8
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   num_epochs: 1
   learning_rate: 1e-5
   weight_decay: 0.01

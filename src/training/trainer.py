@@ -139,6 +139,7 @@ class LatentReasoningTrainer:
         if self.is_main and wandb is not None:
             wandb.init(
                 project=config.logging.wandb_project,
+                name=getattr(config.logging, "wandb_run_name", None),
                 config=dict(config),
             )
 
@@ -447,7 +448,7 @@ class LatentReasoningTrainer:
                 L_stitch = (1 - p) * sum(
                     (g[k] * thought_outputs[k]).sum()
                     for k in range(len(g))
-                )
+                ) / len(g)
 
                 t_sb = time.perf_counter()
                 retain = (d < D - 1)

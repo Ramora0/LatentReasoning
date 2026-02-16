@@ -56,7 +56,7 @@ Instead of backpropagating through K sequential transformer calls, gradient stit
 2. **`loss.backward(retain_graph=True)`**: Computes gradients on `thought_inputs` (leaf tensors at thought positions).
 3. **D stitching iterations**: Extract gradient `g[k]` from each thought input, compute `L_stitch = Σ g[k] · thought_outputs[k]`, call `L_stitch.backward()`. This propagates gradients across thought boundaries through the Phase 3 computation graph.
 
-`stitching_depth` (D) defaults to K (exact gradients). D=1 is likely sufficient since Phase 3's attention already creates cross-boundary dependencies. No gradient checkpointing is used — all activations are stored for the backward passes.
+`stitching_depth` (D) defaults to K (exact gradients).
 
 ### Trainable vs Frozen
 
