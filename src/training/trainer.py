@@ -435,23 +435,19 @@ class LatentReasoningTrainer:
 
             t_stitch = time.perf_counter()
             for d in range(D):
-                t_d = time.perf_counter()
                 g = [t.grad.detach().clone() if t.grad is not None
                      else torch.zeros_like(t) for t in thought_inputs]
                 for t in thought_inputs:
                     t.grad = None
-                print(f"[stitch d={d}] grad extract {time.perf_counter()-t_d:.2f}s", flush=True)
 
                 if d == 0:
                     g_sq_sum = sum(gk.norm().pow(2) for gk in g)
                     stitch_debug["_thought_sensitivity_t"] = g_sq_sum.sqrt()
 
-                t_ls = time.perf_counter()
                 L_stitch = (1 - p) * sum(
                     (g[k] * thought_outputs[k]).sum()
                     for k in range(len(g))
                 )
-                print(f"[stitch d={d}] L_stitch compute {time.perf_counter()-t_ls:.2f}s", flush=True)
 
                 t_sb = time.perf_counter()
                 retain = (d < D - 1)

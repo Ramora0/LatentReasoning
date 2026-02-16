@@ -5,8 +5,8 @@ model:
   name: "MCES10/maths-problems-gemma-2-2b-it"
 
 latent:
-  K: 8
-  stitching_depth: null  # null = use K (exact gradients); set lower for faster training
+  K: 64
+  stitching_depth: 8  # null = use K (exact gradients); set lower for faster training
   p_start: 0.0
   p_end: 0.0
   p_anneal_ratio: 0.8
@@ -15,7 +15,7 @@ training:
   batch_size_per_gpu: 4
   gradient_accumulation_steps: 4
   num_epochs: 5
-  learning_rate: 2e-5
+  learning_rate: 1e-5
   weight_decay: 0.01
   warmup_ratio: 0.1
   max_grad_norm: 10.0
