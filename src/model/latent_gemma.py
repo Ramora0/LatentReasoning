@@ -661,6 +661,51 @@ class LatentReasoningModel(nn.Module):
             result["answer_positions"] = (latent_states.shape[1], None)
         return result
 
+    def _forward_baseline(self, question_ids, question_mask, answer_ids, answer_mask):
+        """Baseline forward pass: standard causal decoder, no latent steps or question masking.
+
+        Concatenates question + answer embeddings, runs through transformer with
+        standard causal attention, and computes cross-entropy loss on answer tokens only.
+        """
+        t_start = time.perf_counter()
+        B = question_ids.shape[0]
+        device = question_ids.device
+
+        # Embed question and answer (shifted right for teacher forcing)
+        q_embeds = self.phase1_encode(question_ids)              # [B, q_len, d_model]
+        a_embeds = self.embed_tokens(answer_ids[:, :-1]) * self.normalizer  # [B, a_len-1, d_model]
+
+        # Concatenate: [question, answer_input]
+        full_embeds = torch.cat([q_embeds, a_embeds], dim=1)     # [B, q_len + a_len-1, d_model]
+        full_mask = torch.cat([question_mask, answer_mask[:, :-1]], dim=1)
+
+        # Standard causal transformer pass (no question masking)
+        hidden_out = self._run_transformer(full_embeds, full_mask)
+
+        # Extract answer-position hidden states
+        q_len = q_embeds.shape[1]
+        answer_hidden = hidden_out[:, q_len:, :]  # [B, a_len-1, d_model]
+
+        # Project to vocabulary
+        logits = self.lm_head(answer_hidden)
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            logits = cap * torch.tanh(logits / cap)
+
+        # Cross-entropy loss on answer tokens
+        labels = answer_ids[:, 1:].clone()
+        label_mask = answer_mask[:, 1:]
+        labels[label_mask == 0] = -100
+
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        print(f"[forward_baseline] {time.perf_counter()-t_start:.2f}s", flush=True)
+        return {"loss": loss, "logits": logits}
+
     def _forward_all(self, question_ids, question_mask, answer_ids, answer_mask, K, p):
         """Full forward pass: encode -> latent steps -> <answer> -> decode.
 
@@ -669,6 +714,10 @@ class LatentReasoningModel(nn.Module):
             'thought_inputs' (list of K leaf tensors with requires_grad=True)
             'thought_outputs' (list of K tensors live in the computation graph)
         """
+        # Baseline mode: K=0 means no latent steps, no question masking
+        if K == 0:
+            return self._forward_baseline(question_ids, question_mask, answer_ids, answer_mask)
+
         if self.use_xla:
             print(f"  [shapes] q={list(question_ids.shape)} q_mask={list(question_mask.shape)} "
                   f"a={list(answer_ids.shape)} a_mask={list(answer_mask.shape)} K={K} p={p}",
