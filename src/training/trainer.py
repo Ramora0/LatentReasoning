@@ -809,7 +809,7 @@ class LatentReasoningTrainer:
             self.optimizer.step()
             self.scheduler.step()
         t_zero = time.perf_counter()
-        self.optimizer.zero_grad(set_to_none=not self.use_xla)
+        self.optimizer.zero_grad()
         print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
         self.optimizer_step += 1
         print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
