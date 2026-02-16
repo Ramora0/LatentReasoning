@@ -677,7 +677,18 @@ class LatentReasoningModel(nn.Module):
 
         # Concatenate: [question, answer_input]
         full_embeds = torch.cat([q_embeds, a_embeds], dim=1)     # [B, q_len + a_len-1, d_model]
-        full_mask = torch.cat([question_mask, answer_mask[:, :-1]], dim=1)
+        full_mask_2d = torch.cat([question_mask, answer_mask[:, :-1]], dim=1)
+
+        # Build 4D causal mask explicitly (HF Gemma2's internal mask creation
+        # can produce wrong-sized masks with certain SDPA/cache configurations)
+        seq_len = full_mask_2d.shape[1]
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        mask_4d = causal.unsqueeze(0).unsqueeze(0).expand(B, 1, seq_len, seq_len).clone()
+        padding_cols = full_mask_2d.bool().unsqueeze(1).unsqueeze(1)  # [B, 1, 1, seq_len]
+        mask_4d = mask_4d & padding_cols
+        full_mask = torch.where(mask_4d,
+                                torch.tensor(0.0, dtype=full_embeds.dtype, device=device),
+                                torch.tensor(torch.finfo(full_embeds.dtype).min, dtype=full_embeds.dtype, device=device))
 
         # Standard causal transformer pass (no question masking)
         hidden_out = self._run_transformer(full_embeds, full_mask)
@@ -889,14 +900,16 @@ class LatentReasoningModel(nn.Module):
         """Baseline inference: encode question, then autoregressive greedy decode.
 
         No latent steps, no <thinking>/<answer> markers, no question masking.
+        Uses DynamicCache explicitly to avoid HF HybridCache mask issues.
         """
         B = question_ids.shape[0]
         device = question_ids.device
 
-        # Encode question and build KV cache
+        # Encode question and build KV cache (DynamicCache avoids HybridCache issues)
         hidden_states = self.phase1_encode(question_ids)
+        kv_cache = DynamicCache()
         hidden_out, kv_cache = self._run_transformer(
-            hidden_states, question_mask, use_cache=True
+            hidden_states, question_mask, past_key_values=kv_cache, use_cache=True
         )
 
         # First token from last question position

@@ -131,6 +131,9 @@ class LatentReasoningTrainer:
         self.optimizer_step = 0
         self._prev_compile_count = 0
         self._prev_compile_time_ns = 0
+        # Per-mark_step compilation tracking
+        self._snap_compile_count = 0
+        self._snap_compile_time_ns = 0
         self._prev_xla_compile_count = 0
 
         # Checkpointing
@@ -306,6 +309,35 @@ class LatentReasoningTrainer:
                     self.model.parameters(), max_norm
                 )
             return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+    # ---- XLA diagnostics ----
+
+    def _xla_snap(self):
+        """Snapshot current XLA compilation counters."""
+        if not self.use_xla:
+            return
+        import torch_xla.debug.metrics as met
+        compile_data = met.metric_data('CompileTime')
+        if compile_data:
+            # compile_data = (count, total_time_ns)
+            self._snap_compile_count = compile_data[0]
+            self._snap_compile_time_ns = compile_data[1]
+
+    def _xla_check(self, label):
+        """Print XLA compilations since last _xla_snap call."""
+        if not self.use_xla:
+            return
+        import torch_xla.debug.metrics as met
+        compile_data = met.metric_data('CompileTime')
+        if compile_data:
+            # compile_data = (count, total_time_ns)
+            delta_count = compile_data[0] - self._snap_compile_count
+            delta_time = (compile_data[1] - self._snap_compile_time_ns) / 1e9
+            if delta_count > 0:
+                print(f"  [XLA:{label}] +{delta_count} compilations ({delta_time:.1f}s)",
+                      flush=True)
+            else:
+                print(f"  [XLA:{label}] no new compilations", flush=True)
 
     # ---- XLA step helper ----
 
@@ -642,9 +674,11 @@ class LatentReasoningTrainer:
 
                         if self.use_xla:
                             accum_loss += loss.detach()
+                            self._xla_snap()
                             t_ms = time.perf_counter()
                             self._xm.mark_step()
                             print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
+                            self._xla_check(f"decode_micro{i}")
                         else:
                             accum_loss += loss.item()
 
@@ -740,9 +774,11 @@ class LatentReasoningTrainer:
         # Optimizer step (XLA needs mark_step which triggers graph execution)
         t_opt = time.perf_counter()
         if self.use_xla:
+            self._xla_snap()
             print("[optim] calling xm.optimizer_step...", flush=True)
             self._xla_step()
             print(f"[optim] xla_step done {time.perf_counter()-t_opt:.2f}s", flush=True)
+            self._xla_check("optim_step")
         else:
             self.optimizer.step()
             self.scheduler.step()
