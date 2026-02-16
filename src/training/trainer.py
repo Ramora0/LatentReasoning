@@ -319,8 +319,9 @@ class LatentReasoningTrainer:
         import torch_xla.debug.metrics as met
         compile_data = met.metric_data('CompileTime')
         if compile_data:
-            self._snap_compile_count = compile_data[1]
-            self._snap_compile_time_ns = compile_data[0]
+            # compile_data = (count, total_time_ns)
+            self._snap_compile_count = compile_data[0]
+            self._snap_compile_time_ns = compile_data[1]
 
     def _xla_check(self, label):
         """Print XLA compilations since last _xla_snap call."""
@@ -329,11 +330,14 @@ class LatentReasoningTrainer:
         import torch_xla.debug.metrics as met
         compile_data = met.metric_data('CompileTime')
         if compile_data:
-            delta_count = compile_data[1] - self._snap_compile_count
-            delta_time = (compile_data[0] - self._snap_compile_time_ns) / 1e9
+            # compile_data = (count, total_time_ns)
+            delta_count = compile_data[0] - self._snap_compile_count
+            delta_time = (compile_data[1] - self._snap_compile_time_ns) / 1e9
             if delta_count > 0:
                 print(f"  [XLA:{label}] +{delta_count} compilations ({delta_time:.1f}s)",
                       flush=True)
+            else:
+                print(f"  [XLA:{label}] no new compilations", flush=True)
 
     # ---- XLA step helper ----
 
@@ -677,11 +681,10 @@ class LatentReasoningTrainer:
                     self._last_thought_token_ids = outputs.get("thought_token_ids")
                     if self.use_xla:
                         accum_loss += loss.detach()
-                        self._xla_snap()
-                        t_ms = time.perf_counter()
-                        self._xm.mark_step()
-                        print(f"[mark_step] {time.perf_counter()-t_ms:.2f}s", flush=True)
-                        self._xla_check("fwd+bwd+stitch")
+                        # No mark_step here — let xm.optimizer_step() compile
+                        # the full step (fwd+bwd+stitch+clip+optim) as one graph.
+                        # Separate mark_steps split the graph into pieces that may
+                        # not cache well with retain_graph=True.
                     else:
                         accum_loss += loss.item()
 
@@ -819,8 +822,9 @@ class LatentReasoningTrainer:
                 import torch_xla.debug.metrics as met
                 compile_data = met.metric_data('CompileTime')
                 if compile_data:
-                    total_time_ns = compile_data[0]
-                    total_count = compile_data[1]
+                    # compile_data = (count, total_time_ns)
+                    total_count = compile_data[0]
+                    total_time_ns = compile_data[1]
                     delta_count = total_count - self._prev_compile_count
                     delta_time_s = (total_time_ns - self._prev_compile_time_ns) / 1e9
                     self._prev_compile_count = total_count
