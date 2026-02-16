@@ -841,10 +841,11 @@ class LatentReasoningModel(nn.Module):
 
         # Process <answer> token through transformer with KV cache (1 token)
         answer_marker = self.answer_token_emb.expand(B, -1, -1)
-        current_mask = torch.cat(
-            [extended_mask, torch.ones(B, 1, dtype=extended_mask.dtype, device=device)],
-            dim=1,
-        )
+        # extended_mask has q_len+1+K entries = kv_cache_len (q_len+K) + 1.
+        # The last thought was generated but never fed back as input, so
+        # the KV cache is one shorter than extended_mask. This means
+        # extended_mask already accounts for kv_cache + the new answer token.
+        current_mask = extended_mask
         # Build 4D mask hiding question tokens for the <answer> position
         answer_mask_4d = self._build_inference_mask(
             current_mask, q_len_orig, answer_marker.dtype, device
