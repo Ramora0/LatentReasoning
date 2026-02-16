@@ -129,6 +129,8 @@ class LatentReasoningTrainer:
 
         # State
         self.optimizer_step = 0
+        self._prev_compile_count = 0
+        self._prev_compile_time_ns = 0
         self._prev_xla_compile_count = 0
 
         # Checkpointing
@@ -779,10 +781,18 @@ class LatentReasoningTrainer:
                 import torch_xla.debug.metrics as met
                 compile_data = met.metric_data('CompileTime')
                 if compile_data:
-                    log_dict["xla/compile_count"] = compile_data[1]
-                    log_dict["xla/compile_time_s"] = compile_data[0] / 1e9
-                    print(f"  [XLA] compilations={compile_data[1]}, "
-                          f"compile_time={compile_data[0]/1e9:.1f}s")
+                    total_time_ns = compile_data[0]
+                    total_count = compile_data[1]
+                    delta_count = total_count - self._prev_compile_count
+                    delta_time_s = (total_time_ns - self._prev_compile_time_ns) / 1e9
+                    self._prev_compile_count = total_count
+                    self._prev_compile_time_ns = total_time_ns
+                    log_dict["xla/compile_count"] = total_count
+                    log_dict["xla/compile_time_s"] = total_time_ns / 1e9
+                    log_dict["xla/compile_count_delta"] = delta_count
+                    log_dict["xla/compile_time_delta_s"] = delta_time_s
+                    print(f"  [XLA] +{delta_count} compilations ({delta_time_s:.1f}s), "
+                          f"total={total_count} ({total_time_ns/1e9:.1f}s)")
             if torch.cuda.is_available():
                 log_dict["system/gpu_memory_allocated_gb"] = (
                     torch.cuda.max_memory_allocated(self.device) / 1e9
