@@ -129,6 +129,7 @@ class LatentReasoningTrainer:
 
         # State
         self.optimizer_step = 0
+        self._prev_xla_compile_count = 0
 
         # Checkpointing
         self.save_dir = Path(config.checkpointing.save_dir)
@@ -695,6 +696,17 @@ class LatentReasoningTrainer:
         print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
         self.optimizer_step += 1
         print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
+
+        # Per-step XLA recompilation tracking
+        if self.use_xla:
+            import torch_xla.debug.metrics as met
+            compile_data = met.metric_data('CompileTime')
+            cur_count = compile_data[1] if compile_data else 0
+            delta = cur_count - self._prev_xla_compile_count
+            if delta > 0:
+                print(f"  [XLA] step {self.optimizer_step}: +{delta} compilations "
+                      f"(total={cur_count})", flush=True)
+            self._prev_xla_compile_count = cur_count
 
         # Accumulate stats for logging window
         t_sync = time.perf_counter()
