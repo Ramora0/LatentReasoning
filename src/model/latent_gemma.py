@@ -61,7 +61,9 @@ class LatentReasoningModel(nn.Module):
         _tokenizer = AutoTokenizer.from_pretrained(config.model.name)
 
         # <thinking> token inserted between question encoding and latent steps
-        _thinking_id = _tokenizer.encode("thinking", add_special_tokens=False)[0]
+        # Initialize from <start_of_turn> — the model associates this token with
+        # "begin generating", which aligns with the start of latent reasoning.
+        _thinking_id = _tokenizer.convert_tokens_to_ids("<start_of_turn>")
         _thinking_emb = self.base_model.model.embed_tokens.weight[_thinking_id].detach().clone()
         self.thinking_token_emb = nn.Parameter(
             (_thinking_emb * self.normalizer).reshape(1, 1, self.d_model)

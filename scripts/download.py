@@ -81,6 +81,10 @@ def main():
     print("[1/3] Model: MCES10/maths-problems-gemma-2-2b-it")
     download_model("MCES10/maths-problems-gemma-2-2b-it", scratch_dir)
 
+    # 1b. Alternate model
+    print("[1b/3] Model: MCES10/maths-problems-gemma-2-2b-it-8k")
+    download_model("google/gemma-2-2b-it", scratch_dir)
+
     # 2. Training dataset
     print("[2/3] Training data: SynthLabsAI/Big-Math-RL-Verified")
     download_dataset("SynthLabsAI/Big-Math-RL-Verified", scratch_dir)
