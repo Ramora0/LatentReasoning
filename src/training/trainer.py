@@ -820,17 +820,18 @@ class LatentReasoningTrainer:
             self._prev_xla_compile_count = cur_count
 
         # Accumulate stats for logging window
-        # On XLA, avoid .item() which breaks the lazy graph — accumulate as tensors,
-        # only materialize inside the logging block
+        # On XLA, keep running tensor sums so only one .item() is needed at
+        # logging time.  A list of tensors would require N .item() calls, each
+        # compiling a separate tiny graph and stalling for 30-40 s.
         if self.use_xla:
             if self.is_main:
                 loss_val = accum_loss.detach() if isinstance(accum_loss, torch.Tensor) else torch.tensor(accum_loss, device=self.device)
                 grad_val = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm, device=self.device)
-                if not hasattr(self, '_xla_log_losses'):
-                    self._xla_log_losses = []
-                    self._xla_log_grads = []
-                self._xla_log_losses.append(loss_val)
-                self._xla_log_grads.append(grad_val)
+                if not hasattr(self, '_xla_log_loss_sum'):
+                    self._xla_log_loss_sum = torch.zeros((), device=self.device)
+                    self._xla_log_grad_sum = torch.zeros((), device=self.device)
+                self._xla_log_loss_sum = self._xla_log_loss_sum + loss_val
+                self._xla_log_grad_sum = self._xla_log_grad_sum + grad_val
         else:
             log_loss += accum_loss
             log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -855,13 +856,13 @@ class LatentReasoningTrainer:
         # Logging (based on optimizer steps)
         if self.is_main and self.optimizer_step % log_every == 0:
             t_log = time.perf_counter()
-            # On XLA, materialize accumulated tensor stats now (inside logging block).
-            # Tensors are already materialized from xm.optimizer_step()'s mark_step().
-            if self.use_xla and hasattr(self, '_xla_log_losses') and self._xla_log_losses:
-                log_loss = sum(t.item() for t in self._xla_log_losses)
-                log_grad_norm = sum(t.item() for t in self._xla_log_grads)
-                self._xla_log_losses.clear()
-                self._xla_log_grads.clear()
+            # On XLA, materialize the running sums with a single .item() each.
+            # The sums are already computed on-device so this just transfers two scalars.
+            if self.use_xla and hasattr(self, '_xla_log_loss_sum'):
+                log_loss = self._xla_log_loss_sum.item()
+                log_grad_norm = self._xla_log_grad_sum.item()
+                self._xla_log_loss_sum = torch.zeros((), device=self.device)
+                self._xla_log_grad_sum = torch.zeros((), device=self.device)
             avg_loss = log_loss / log_steps
             avg_grad_norm = log_grad_norm / log_steps
             step_time = time.monotonic() - step_start_time
