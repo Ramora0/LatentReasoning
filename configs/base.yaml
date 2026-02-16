@@ -38,7 +38,7 @@ data:
 
 eval:
   benchmarks: [gsm8k]
-  eval_every_samples: 65536
+  eval_every_samples: 32768
   max_new_tokens: 64
 
 logging:
@@ -48,5 +48,5 @@ logging:
 
 checkpointing:
   save_dir: "./checkpoints"
-  save_every_samples: 65536
+  save_every_samples: 32768
   keep_last_n: 3

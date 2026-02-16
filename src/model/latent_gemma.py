@@ -520,7 +520,7 @@ class LatentReasoningModel(nn.Module):
         labels = answer_ids[:, 1:].clone()  # [B, a_len-1]
         # Set padding positions to -100
         label_mask = answer_mask[:, 1:]
-        labels[label_mask == 0] = -100
+        labels = labels.masked_fill(label_mask == 0, -100)
 
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
@@ -706,7 +706,7 @@ class LatentReasoningModel(nn.Module):
         # Cross-entropy loss on answer tokens
         labels = answer_ids[:, 1:].clone()
         label_mask = answer_mask[:, 1:]
-        labels[label_mask == 0] = -100
+        labels = labels.masked_fill(label_mask == 0, -100)
 
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),

@@ -451,6 +451,17 @@ class LatentReasoningTrainer:
         stitch_debug = {}
 
         if thought_inputs and thought_outputs and D > 0:
+            # Compute thought-token similarity: how close are latent thoughts
+            # to their nearest decoded token embedding?
+            thought_token_ids = outputs.get("thought_token_ids")
+            if thought_token_ids is not None:
+                with torch.no_grad():
+                    raw_model = getattr(self.model, "module", self.model)
+                    thought_cat = torch.cat(thought_inputs, dim=1)  # [B, K, d_model]
+                    tok_emb = raw_model.embed_tokens(thought_token_ids) * raw_model.normalizer  # [B, K, d_model]
+                    cos_sim = F.cosine_similarity(thought_cat, tok_emb, dim=-1)  # [B, K]
+                    stitch_debug["_thought_token_cos_sim"] = cos_sim.mean()
+
             t_back = time.perf_counter()
             loss.backward(retain_graph=True)
             print(f"[backward] {time.perf_counter()-t_back:.2f}s", flush=True)
@@ -792,7 +803,7 @@ class LatentReasoningTrainer:
         if self.use_xla:
             import torch_xla.debug.metrics as met
             compile_data = met.metric_data('CompileTime')
-            cur_count = compile_data[1] if compile_data else 0
+            cur_count = compile_data[0] if compile_data else 0
             delta = cur_count - self._prev_xla_compile_count
             if delta > 0:
                 print(f"  [XLA] step {self.optimizer_step}: +{delta} compilations "
@@ -800,31 +811,46 @@ class LatentReasoningTrainer:
             self._prev_xla_compile_count = cur_count
 
         # Accumulate stats for logging window
-        t_sync = time.perf_counter()
+        # On XLA, avoid .item() which breaks the lazy graph — accumulate as tensors,
+        # only materialize inside the logging block
         if self.use_xla:
-            log_loss += accum_loss.item() if isinstance(accum_loss, torch.Tensor) else accum_loss
+            if self.is_main:
+                loss_val = accum_loss.detach() if isinstance(accum_loss, torch.Tensor) else torch.tensor(accum_loss, device=self.device)
+                grad_val = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm, device=self.device)
+                if not hasattr(self, '_xla_log_losses'):
+                    self._xla_log_losses = []
+                    self._xla_log_grads = []
+                self._xla_log_losses.append(loss_val)
+                self._xla_log_grads.append(grad_val)
         else:
             log_loss += accum_loss
-        print(f"[loss_sync] {time.perf_counter()-t_sync:.2f}s", flush=True)
-        log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
         log_steps += 1
         accum_loss = 0.0
 
-        # Accumulate gradient decomposition stats
+        # Accumulate gradient decomposition stats (skip .item() on XLA)
         if hasattr(self, '_stitch_debug') and self._stitch_debug:
             sd = self._stitch_debug
-            if "_thought_mean_t" in sd:
-                log_thought_mean += sd["_thought_mean_t"].item()
-                log_answer_mean += sd["_answer_mean_t"].item()
-                log_thought_total += sd["_thought_total_t"].item()
-                log_answer_total += sd["_answer_total_t"].item()
-            if "_thought_sensitivity_t" in sd:
-                log_sensitivity += sd["_thought_sensitivity_t"].item()
+            if not self.use_xla:
+                if "_thought_mean_t" in sd:
+                    log_thought_mean += sd["_thought_mean_t"].item()
+                    log_answer_mean += sd["_answer_mean_t"].item()
+                    log_thought_total += sd["_thought_total_t"].item()
+                    log_answer_total += sd["_answer_total_t"].item()
+                if "_thought_sensitivity_t" in sd:
+                    log_sensitivity += sd["_thought_sensitivity_t"].item()
             log_grad_decomp_steps += 1
 
         # Logging (based on optimizer steps)
         if self.is_main and self.optimizer_step % log_every == 0:
             t_log = time.perf_counter()
+            # On XLA, materialize accumulated tensor stats now (inside logging block).
+            # Tensors are already materialized from xm.optimizer_step()'s mark_step().
+            if self.use_xla and hasattr(self, '_xla_log_losses') and self._xla_log_losses:
+                log_loss = sum(t.item() for t in self._xla_log_losses)
+                log_grad_norm = sum(t.item() for t in self._xla_log_grads)
+                self._xla_log_losses.clear()
+                self._xla_log_grads.clear()
             avg_loss = log_loss / log_steps
             avg_grad_norm = log_grad_norm / log_steps
             step_time = time.monotonic() - step_start_time
