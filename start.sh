@@ -1,7 +1,5 @@
-git clone https://github.com/Ramora0/LatentReasoning.git
 sudo apt-get update
 sudo apt-get install -y python3.10-venv
-cd LatentReasoning/
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[tpu]"

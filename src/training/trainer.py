@@ -137,6 +137,12 @@ class LatentReasoningTrainer:
         self._snap_compile_time_ns = 0
         self._prev_xla_compile_count = 0
 
+        # XLA step-closure accumulators for loss/grad logging.
+        # Updated inside add_step_closure callbacks so .item() never runs
+        # in the main graph-tracing path.
+        self._closure_log_loss = 0.0
+        self._closure_log_grad = 0.0
+
         # Checkpointing
         self.save_dir = Path(config.checkpointing.save_dir)
         if self.is_main:
@@ -803,7 +809,7 @@ class LatentReasoningTrainer:
             self.optimizer.step()
             self.scheduler.step()
         t_zero = time.perf_counter()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=not self.use_xla)
         print(f"[zero_grad] {time.perf_counter()-t_zero:.2f}s", flush=True)
         self.optimizer_step += 1
         print(f"[optim] total {time.perf_counter()-t_opt:.2f}s", flush=True)
@@ -819,19 +825,19 @@ class LatentReasoningTrainer:
                       f"(total={cur_count})", flush=True)
             self._prev_xla_compile_count = cur_count
 
-        # Accumulate stats for logging window
-        # On XLA, keep running tensor sums so only one .item() is needed at
-        # logging time.  A list of tensors would require N .item() calls, each
-        # compiling a separate tiny graph and stalling for 30-40 s.
+        # Accumulate stats for logging window as Python floats.
+        # On XLA, use add_step_closure to defer .item() to a callback that runs
+        # after graph execution.  This keeps .item() completely out of the
+        # graph-tracing path, preventing any sync-boundary artifacts that cause
+        # graph input count fluctuations and recompilations.
         if self.use_xla:
-            if self.is_main:
-                loss_val = accum_loss.detach() if isinstance(accum_loss, torch.Tensor) else torch.tensor(accum_loss, device=self.device)
-                grad_val = grad_norm.detach() if isinstance(grad_norm, torch.Tensor) else torch.tensor(grad_norm, device=self.device)
-                if not hasattr(self, '_xla_log_loss_sum'):
-                    self._xla_log_loss_sum = torch.zeros((), device=self.device)
-                    self._xla_log_grad_sum = torch.zeros((), device=self.device)
-                self._xla_log_loss_sum = self._xla_log_loss_sum + loss_val
-                self._xla_log_grad_sum = self._xla_log_grad_sum + grad_val
+            def _accum_closure(loss_t, grad_t, trainer):
+                trainer._closure_log_loss += loss_t.item()
+                trainer._closure_log_grad += grad_t.item()
+            self._xm.add_step_closure(
+                _accum_closure,
+                args=(accum_loss.detach(), grad_norm.detach(), self),
+            )
         else:
             log_loss += accum_loss
             log_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -856,15 +862,18 @@ class LatentReasoningTrainer:
         # Logging (based on optimizer steps)
         if self.is_main and self.optimizer_step % log_every == 0:
             t_log = time.perf_counter()
-            # On XLA, materialize the running sums with a single .item() each.
-            # The sums are already computed on-device so this just transfers two scalars.
-            if self.use_xla and hasattr(self, '_xla_log_loss_sum'):
-                log_loss = self._xla_log_loss_sum.item()
-                log_grad_norm = self._xla_log_grad_sum.item()
-                self._xla_log_loss_sum = torch.zeros((), device=self.device)
-                self._xla_log_grad_sum = torch.zeros((), device=self.device)
-            avg_loss = log_loss / log_steps
-            avg_grad_norm = log_grad_norm / log_steps
+            # On XLA, closures run inside the next xm.optimizer_step()'s
+            # mark_step(), so the current step's value isn't available yet.
+            # We log values through step N-1 — the one-step delay is
+            # negligible but avoids an extra mark_step() that would split
+            # the graph and cause recompilation every log_every steps.
+            if self.use_xla:
+                log_loss = self._closure_log_loss
+                log_grad_norm = self._closure_log_grad
+                self._closure_log_loss = 0.0
+                self._closure_log_grad = 0.0
+            avg_loss = log_loss / max(log_steps, 1)
+            avg_grad_norm = log_grad_norm / max(log_steps, 1)
             step_time = time.monotonic() - step_start_time
             samples_per_sec = (
                 log_steps * self.grad_accum_steps
@@ -957,14 +966,14 @@ class LatentReasoningTrainer:
             log_grad_decomp_steps = 0
             step_start_time = time.monotonic()
 
+        # Checkpointing
+        if self.optimizer_step % save_every == 0:
+            self._save_checkpoint()
+
         # Evaluation
         if self.optimizer_step % eval_every == 0 and self.evaluator is not None:
             self._run_eval(K, p)
             self.model.train()
-
-        # Checkpointing
-        if self.optimizer_step % save_every == 0:
-            self._save_checkpoint()
 
         pbar.update(1)
 
