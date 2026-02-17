@@ -2,7 +2,7 @@ paths:
   scratch_dir: "/fs/scratch/PAS2836/lees_stuff"
 
 model:
-  name: "MCES10/maths-problems-gemma-2-2b-it"
+  name: "google/gemma-2-2b-it"
 
 latent:
   K: 8
