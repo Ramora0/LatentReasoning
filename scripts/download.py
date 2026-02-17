@@ -82,7 +82,7 @@ def main():
     download_model("MCES10/maths-problems-gemma-2-2b-it", scratch_dir)
 
     # 1b. Alternate model
-    print("[1b/3] Model: MCES10/maths-problems-gemma-2-2b-it-8k")
+    print("[1b/3] Model: google/gemma-2-2b-it")
     download_model("google/gemma-2-2b-it", scratch_dir)
 
     # 2. Training dataset

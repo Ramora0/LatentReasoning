@@ -1,0 +1,54 @@
+paths:
+  scratch_dir: "/fs/scratch/PAS2836/lees_stuff"
+
+model:
+  name: "MCES10/maths-problems-gemma-2-2b-it"
+
+latent:
+  K: 8
+  stitching_depth: 1  # null = use K (exact gradients); set lower for faster training
+  p_start: 0.0
+  p_end: 0.0
+  p_anneal_ratio: 0.8
+  question_anneal_start: 0.0  # fraction of total optimizer steps before question annealing begins
+  question_anneal_end: 0.001    # fraction of total optimizer steps at which q_visibility reaches 1.0
+
+training:
+  batch_size_per_gpu: 4
+  gradient_accumulation_steps: 4
+  num_epochs: 1
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 10.0
+  bf16: true
+  gradient_checkpointing: true
+
+distributed:
+  backend: "cuda"                          # "cuda" for GPU/NCCL/FSDP, "xla" for TPU/XLA FSDP
+  fsdp: true
+  fsdp_sharding_strategy: "FULL_SHARD"
+  fsdp_wrap_policy: "transformer_layer"
+  fsdp_cpu_offload: false
+  fsdp_activation_checkpointing: true
+  fsdp_mixed_precision: "bf16"
+
+data:
+  dataset: "SynthLabsAI/Big-Math-RL-Verified"
+  max_question_tokens: 512
+  max_answer_tokens: 64
+
+eval:
+  benchmarks: [gsm8k]
+  eval_every_samples: 65536
+  max_new_tokens: 64
+
+logging:
+  wandb_project: "latent-reasoning"
+  wandb_run_name: null
+  log_every_samples: 320
+
+checkpointing:
+  save_dir: "./checkpoints-question-annealed"
+  save_every_samples: 32768
+  keep_last_n: 3
